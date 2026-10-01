@@ -73,6 +73,8 @@ class Repo(private val app: Application) {
     val autoAccept = MutableStateFlow(false)
     /** Where received files go: a folder the user picked, or null for Downloads/AndroidDrop. */
     val saveFolder = MutableStateFlow(prefs.getString(KEY_FOLDER, null)?.let(Uri::parse))
+    /** "system", "light" or "dark". */
+    val theme = MutableStateFlow(prefs.getString(KEY_THEME, "system") ?: "system")
     /** Where each received file was saved, to open it from the list. Until the app closes. */
     val savedFiles = MutableStateFlow<Map<String, Uri>>(emptyMap())
 
@@ -154,6 +156,11 @@ class Repo(private val app: Application) {
         me.value = parseDevice(session.getJSONObject("device"))
         serverName.value = session.optString("serverName")
         autoAccept.value = session.optBoolean("autoAccept")
+    }
+
+    fun setTheme(mode: String) {
+        prefs.edit().putString(KEY_THEME, mode).apply()
+        theme.value = mode
     }
 
     /** Saves received files into [folder] (picked with the system's folder chooser) from now on; null goes back to Downloads. */
@@ -499,6 +506,7 @@ class Repo(private val app: Application) {
         private const val KEY_ADDRESS = "address"
         private const val KEY_SERVER = "serverName"
         private const val KEY_FOLDER = "saveFolder"
+        private const val KEY_THEME = "theme"
         /** How long to keep reconnecting without getting any further before giving up on a file. */
         private const val RECONNECT_FOR_MS = 3 * 60_000L
         /** Worth trying again: the connection dropped, or the computer hasn't noticed the old one did. */

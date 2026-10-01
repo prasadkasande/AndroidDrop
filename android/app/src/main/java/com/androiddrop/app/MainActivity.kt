@@ -6,7 +6,9 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
 import androidx.core.content.IntentCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 class MainActivity : ComponentActivity() {
 
@@ -16,7 +18,8 @@ class MainActivity : ComponentActivity() {
         val repo = (application as DropApp).repo
         if (savedInstanceState == null) takeShare(intent)
         setContent {
-            DropTheme {
+            val theme by repo.theme.collectAsStateWithLifecycle()
+            DropTheme(theme) {
                 App(repo)
             }
         }

@@ -1,5 +1,6 @@
 package com.androiddrop.app
 
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -69,6 +70,17 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.toSize
+import androidx.core.view.WindowCompat
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -135,9 +147,29 @@ private val Success = Color(0xFF3F8F5A)
 private val Warning = Color(0xFFB7791F)
 
 @Composable
-fun DropTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) Dark else Light, content = content)
+fun DropTheme(mode: String, content: @Composable () -> Unit) {
+    val dark = when (mode) {
+        "light" -> false
+        "dark" -> true
+        else -> isSystemInDarkTheme()
+    }
+    // The clock and icons in the system bars follow the app's theme, not the phone's.
+    val view = LocalView.current
+    SideEffect {
+        (view.context as? Activity)?.window?.let { window ->
+            WindowCompat.getInsetsController(window, view).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        }
+    }
+    CompositionLocalProvider(LocalDark provides dark) {
+        MaterialTheme(colorScheme = if (dark) Dark else Light, content = content)
+    }
 }
+
+/** Whether the app is showing its dark theme, which the user can set apart from the phone's. */
+private val LocalDark = staticCompositionLocalOf { false }
 
 /** A background and the colour drawn on it, for light and dark. */
 private class Tint(val lightBack: Long, val lightInk: Long, val darkBack: Long, val darkInk: Long) {
@@ -327,7 +359,7 @@ private fun Home(repo: Repo, snackbar: SnackbarHostState) {
     var target by remember { mutableStateOf<String?>(null) }
     var choosing by remember { mutableStateOf<Outgoing?>(null) }
     var later by remember { mutableStateOf(setOf<String>()) }
-    val dark = isSystemInDarkTheme()
+    val dark = LocalDark.current
 
     val meId = me?.id
     val peers = devices.filter { it.id != meId }
@@ -616,19 +648,28 @@ private fun Avatar(id: String, host: Boolean, platform: String, size: Dp, dark: 
 private fun Stage(peers: List<Device>, dark: Boolean, modifier: Modifier = Modifier, onPick: (Device) -> Unit) {
     val ring = MaterialTheme.colorScheme.onSurface.copy(alpha = if (dark) 0.10f else 0.08f)
     Surface(shape = CARD, color = MaterialTheme.colorScheme.surface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), modifier = modifier.fillMaxWidth()) {
-        // Faint rings spreading from the middle, as on the computer.
+        // Faint rings, as on the computer, spreading from the middle of the avatars: from the device itself when
+        // there is one, from the middle of the group when there are several.
+        var origin by remember { mutableStateOf(Offset.Zero) }
+        val spots = remember { mutableStateMapOf<String, Rect>() }
+        val avatars = peers.mapNotNull { spots[it.id] }
+        val middle = if (avatars.isEmpty()) null else Offset(
+            (avatars.minOf { it.left } + avatars.maxOf { it.right }) / 2 - origin.x,
+            (avatars.minOf { it.top } + avatars.maxOf { it.bottom }) / 2 - origin.y,
+        )
         Box(
             contentAlignment = Alignment.Center,
-            modifier = Modifier.fillMaxSize().drawBehind {
-                val reach = maxOf(size.width, size.height) * 0.75f
-                var radius = 64.dp.toPx()
+            modifier = Modifier.fillMaxSize().onGloballyPositioned { origin = it.positionInRoot() }.drawBehind {
+                val from = middle ?: center
+                val reach = size.width + size.height
+                var radius = 68.dp.toPx()
                 while (radius < reach) {
-                    drawCircle(color = ring, radius = radius, style = Stroke(width = 1.dp.toPx()))
+                    drawCircle(color = ring, radius = radius, center = from, style = Stroke(width = 1.dp.toPx()))
                     radius += 52.dp.toPx()
                 }
             },
         ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.verticalScroll(rememberScrollState()).padding(vertical = 16.dp, horizontal = 12.dp)) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.verticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 16.dp, bottom = if (peers.isEmpty()) 16.dp else 44.dp)) {
             if (peers.isEmpty()) {
                 Text("No other devices yet", fontSize = 17.sp, fontWeight = FontWeight.Medium)
                 Spacer(Modifier.height(6.dp))
@@ -640,22 +681,26 @@ private fun Stage(peers: List<Device>, dark: Boolean, modifier: Modifier = Modif
                             horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier.width(120.dp).clip(RoundedCornerShape(18.dp)).clickable { onPick(device) }.padding(8.dp),
                         ) {
-                            Avatar(device.id, device.host, device.platform, 76.dp, dark, device.online)
+                            Box(modifier = Modifier.onGloballyPositioned { spots[device.id] = Rect(it.positionInRoot(), it.size.toSize()) }) {
+                                Avatar(device.id, device.host, device.platform, 76.dp, dark, device.online)
+                            }
                             Spacer(Modifier.height(10.dp))
                             Text(device.name, fontSize = 15.5.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis, lineHeight = 20.sp)
                             Text(if (device.online) "Nearby" else "Away", fontSize = 14.sp, color = if (device.online) Success else MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
-                Spacer(Modifier.height(20.dp))
-                val online = peers.count { it.online }
-                Text(
-                    if (online == 0) "No devices are open right now. They'll get your files when they open AndroidDrop." else "$online of ${peers.size} ${if (peers.size == 1) "device is" else "devices are"} nearby",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                )
             }
+        }
+        if (peers.isNotEmpty()) {
+            val online = peers.count { it.online }
+            Text(
+                if (online == 0) "No devices are open right now" else "$online of ${peers.size} ${if (peers.size == 1) "device is" else "devices are"} nearby",
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp, start = 12.dp, end = 12.dp),
+            )
         }
         }
     }
@@ -937,9 +982,10 @@ private fun Preview(repo: Repo, transferId: String, fileId: String, modifier: Mo
 private fun SettingsSheet(repo: Repo, me: Device?, serverName: String, connected: Boolean, onClose: () -> Unit) {
     val autoAccept by repo.autoAccept.collectAsStateWithLifecycle()
     val folder by repo.saveFolder.collectAsStateWithLifecycle()
+    val theme by repo.theme.collectAsStateWithLifecycle()
     var renaming by remember { mutableStateOf(false) }
     var unpairing by remember { mutableStateOf(false) }
-    val dark = isSystemInDarkTheme()
+    val dark = LocalDark.current
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri -> if (uri != null) repo.setSaveFolder(uri) }
 
     ModalBottomSheet(onDismissRequest = onClose, containerColor = MaterialTheme.colorScheme.surface) {
@@ -952,6 +998,22 @@ private fun SettingsSheet(repo: Repo, me: Device?, serverName: String, connected
                     detail = "Android · Connected to $serverName",
                     leading = { Avatar(me?.id.orEmpty(), false, "ANDROID", 44.dp, dark) },
                 ) { FilledTonalButton(onClick = { renaming = true }, modifier = Modifier.height(40.dp)) { Text("Rename") } }
+            }
+
+            Group("Appearance") {
+                Row(modifier = Modifier.padding(6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach { (mode, label) ->
+                        val chosen = theme == mode
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.weight(1f).height(48.dp).clip(RoundedCornerShape(13.dp))
+                                .background(if (chosen) MaterialTheme.colorScheme.primary else Color.Transparent)
+                                .clickable { repo.setTheme(mode) },
+                        ) {
+                            Text(label, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = if (chosen) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
             }
 
             Group("Receiving") {
