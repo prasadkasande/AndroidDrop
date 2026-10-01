@@ -16,7 +16,16 @@ import java.util.concurrent.TimeUnit
 data class Device(val id: String, val name: String, val platform: String, val host: Boolean, val online: Boolean)
 
 /** UPLOADING → READY (on the Mac) → SAVED (in the Mac's folder) or DELIVERED (downloaded by a phone). */
-data class TransferFile(val id: String, val name: String, val size: Long, val mimeType: String, val state: String, val available: Boolean)
+data class TransferFile(
+    val id: String,
+    val name: String,
+    val size: Long,
+    val mimeType: String,
+    val state: String,
+    val available: Boolean,
+    /** The computer can serve a small preview of it. */
+    val thumbnail: Boolean,
+)
 
 data class Transfer(
     val id: String,
@@ -65,6 +74,7 @@ fun parseTransfer(json: JSONObject): Transfer {
                 mimeType = file.optString("mimeType", "application/octet-stream"),
                 state = file.getString("state"),
                 available = file.optBoolean("available"),
+                thumbnail = file.optBoolean("thumbnail"),
             )
         },
         createdAt = json.optString("createdAt"),
@@ -131,6 +141,17 @@ class ApiClient(val baseUrl: String, private val token: String?) {
     fun devices(): List<Device> = JSONArray(call("GET", "/api/devices")).let { list -> (0 until list.length()).map { parseDevice(list.getJSONObject(it)) } }
 
     fun transfers(): List<Transfer> = JSONArray(call("GET", "/api/transfers")).let { list -> (0 until list.length()).map { parseTransfer(list.getJSONObject(it)) } }
+
+    fun rename(name: String): JSONObject = JSONObject(call("PATCH", "/api/session", JSONObject().put("name", name)))
+
+    fun setAutoAccept(value: Boolean): JSONObject = JSONObject(call("PATCH", "/api/session/preferences", JSONObject().put("autoAccept", value)))
+
+    /** A small JPEG preview of a photo, or null if there isn't one. */
+    fun thumbnail(transferId: String, fileId: String): ByteArray? = try {
+        execute(request("/api/transfers/$transferId/files/$fileId/thumbnail").get().build()).use { it.body?.bytes() }
+    } catch (error: ApiException) {
+        null
+    }
 
     fun forget() {
         call("POST", "/api/session/forget")

@@ -3,10 +3,16 @@ package com.androiddrop.app
 import android.app.Application
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.LruCache
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -63,6 +69,16 @@ class Repo(private val app: Application) {
 
     class Share(val uris: List<Uri>, val text: String?)
 
+    /** This phone skips the Accept/Decline prompt. */
+    val autoAccept = MutableStateFlow(false)
+    /** Where received files go: a folder the user picked, or null for Downloads/AndroidDrop. */
+    val saveFolder = MutableStateFlow(prefs.getString(KEY_FOLDER, null)?.let(Uri::parse))
+    /** Where each received file was saved, to open it from the list. Until the app closes. */
+    val savedFiles = MutableStateFlow<Map<String, Uri>>(emptyMap())
+
+    private val previews = LruCache<String, ImageBitmap>(80)
+    private val unsaved = ConcurrentHashMap<String, IntArray>()
+
     private var api: ApiClient? = null
     private var stream: EventSource? = null
     /** Bumped whenever the connection is replaced, so an old stream's callbacks are ignored. */
@@ -116,6 +132,55 @@ class Repo(private val app: Application) {
     }
 
     val lastAddress: String get() = prefs.getString(KEY_ADDRESS, "").orEmpty().removePrefix("http://")
+
+    // ---------- Settings ----------
+
+    fun rename(name: String) = setting { client -> client.rename(name.trim()) }
+
+    fun setAutoAccept(value: Boolean) = setting { client -> client.setAutoAccept(value) }
+
+    private fun setting(change: (ApiClient) -> JSONObject) {
+        val client = api ?: return
+        scope.launch {
+            try {
+                applySession(change(client))
+            } catch (error: ApiException) {
+                notices.tryEmit(error.message.orEmpty())
+            }
+        }
+    }
+
+    private fun applySession(session: JSONObject) {
+        me.value = parseDevice(session.getJSONObject("device"))
+        serverName.value = session.optString("serverName")
+        autoAccept.value = session.optBoolean("autoAccept")
+    }
+
+    /** Saves received files into [folder] (picked with the system's folder chooser) from now on; null goes back to Downloads. */
+    fun setSaveFolder(folder: Uri?) {
+        val resolver = app.contentResolver
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        saveFolder.value?.let { runCatching { resolver.releasePersistableUriPermission(it, flags) } }
+        if (folder != null) runCatching { resolver.takePersistableUriPermission(folder, flags) }
+        prefs.edit().putString(KEY_FOLDER, folder?.toString()).apply()
+        saveFolder.value = folder
+    }
+
+    /** "Downloads/AndroidDrop", or the picked folder as "Movies/Trips". */
+    fun folderName(folder: Uri?): String {
+        if (folder == null) return "Downloads/AndroidDrop"
+        val id = runCatching { DocumentsContract.getTreeDocumentId(folder) }.getOrNull() ?: return "the chosen folder"
+        return id.substringAfter(':').ifEmpty { "Internal storage" }
+    }
+
+    /** A photo's small preview, fetched once and kept in memory. Blocks: call off the main thread. */
+    fun preview(transferId: String, fileId: String): ImageBitmap? {
+        previews.get(fileId)?.let { return it }
+        val bytes = api?.thumbnail(transferId, fileId) ?: return null
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() ?: return null
+        previews.put(fileId, bitmap)
+        return bitmap
+    }
 
     // ---------- Live connection ----------
 
@@ -174,9 +239,7 @@ class Repo(private val app: Application) {
     private fun sync() {
         val client = api ?: return
         try {
-            val session = client.session()
-            me.value = parseDevice(session.getJSONObject("device"))
-            serverName.value = session.optString("serverName")
+            applySession(client.session())
             devices.value = client.devices()
             val all = client.transfers()
             transfers.value = all
@@ -326,27 +389,58 @@ class Repo(private val app: Application) {
     private fun fetchReady(transfer: Transfer) {
         val self = me.value ?: return
         if (transfer.recipientId != self.id || transfer.status != "ACCEPTED") return
-        transfer.files.filter { it.state == "READY" && fetching.add(it.id) }.forEach { file ->
+        val ready = transfer.files.filter { it.state == "READY" && fetching.add(it.id) }
+        if (ready.isEmpty()) return
+        // [files still to save, files saved]: one "Saved" message per batch, not one per file.
+        val tally = unsaved.getOrPut(transfer.id) { IntArray(2) }
+        synchronized(tally) { tally[0] += ready.size }
+        ready.forEach { file ->
             scope.launch {
-                downloads.withLock { save(transfer, file) }
+                val saved = downloads.withLock { save(transfer, file) }
+                val finished = synchronized(tally) {
+                    tally[0]--
+                    if (saved) tally[1]++
+                    if (tally[0] == 0) tally[1].also { tally[1] = 0 } else -1
+                }
+                if (finished > 0) {
+                    val what = if (finished == 1) file.name else "$finished files"
+                    notices.tryEmit("Saved $what to ${folderName(saveFolder.value)}")
+                }
             }
         }
     }
 
-    private suspend fun save(transfer: Transfer, file: TransferFile) {
-        val client = api ?: return
+    /** A new, empty file for a received one: in the picked folder, or in Downloads/AndroidDrop. */
+    private fun createTarget(file: TransferFile): Uri? {
         val resolver = app.contentResolver
+        saveFolder.value?.let { folder ->
+            val created = runCatching {
+                val parent = DocumentsContract.buildDocumentUriUsingTree(folder, DocumentsContract.getTreeDocumentId(folder))
+                DocumentsContract.createDocument(resolver, parent, file.mimeType, file.name)
+            }.getOrNull()
+            if (created != null) return created
+            notices.tryEmit("Can't save into ${folderName(folder)} any more, so it's going to Downloads.")
+        }
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, file.name)
             put(MediaStore.Downloads.MIME_TYPE, file.mimeType)
             put(MediaStore.Downloads.RELATIVE_PATH, "Download/AndroidDrop")
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
-        val target = resolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
+        return resolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
+    }
+
+    private fun isDownloadsEntry(target: Uri) = target.authority == MediaStore.AUTHORITY
+
+    /** Downloads one file to where received files go. True once it's fully saved. */
+    private suspend fun save(transfer: Transfer, file: TransferFile): Boolean {
+        val client = api ?: return false
+        val resolver = app.contentResolver
+        val target = createTarget(file)
         if (target == null) {
             notices.tryEmit("Couldn't save ${file.name}.")
             fetching.remove(file.id)
-            return
+            return false
         }
         var written = 0L
         var lastProgress = System.currentTimeMillis()
@@ -390,19 +484,21 @@ class Repo(private val app: Application) {
             delay(pause)
         }
         if (done) {
-            resolver.update(target, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
-            notices.tryEmit("Saved ${file.name} to Downloads")
+            if (isDownloadsEntry(target)) resolver.update(target, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
+            savedFiles.update { it + (file.id to target) }
         } else {
-            resolver.delete(target, null, null)
+            runCatching { if (isDownloadsEntry(target)) resolver.delete(target, null, null) else DocumentsContract.deleteDocument(resolver, target) }
             fetching.remove(file.id)
             if (transfer.id !in cancelled) notices.tryEmit("Couldn't save ${file.name}. It'll try again when you reopen AndroidDrop.")
         }
+        return done
     }
 
     companion object {
         private const val KEY_TOKEN = "token"
         private const val KEY_ADDRESS = "address"
         private const val KEY_SERVER = "serverName"
+        private const val KEY_FOLDER = "saveFolder"
         /** How long to keep reconnecting without getting any further before giving up on a file. */
         private const val RECONNECT_FOR_MS = 3 * 60_000L
         /** Worth trying again: the connection dropped, or the computer hasn't noticed the old one did. */
