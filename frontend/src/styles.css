@@ -1,0 +1,222 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+/* Phones and tablets: finger-sized controls and larger text. */
+@custom-variant touch (@media (pointer: coarse));
+
+/* ---------- Design tokens ----------
+ * A native-feeling Mac layout in a warm palette: cream canvas, warm-white surfaces, ink text and ink pill buttons,
+ * with soft pastel colours reserved for device avatars. Text is set in Plus Jakarta Sans, a warm, slightly rounded
+ * sans that matches the logo; the system font is the fallback.
+ *
+ *   canvas   page background            bg        raised surfaces: lists, cards, dialogs, inputs
+ *   sidebar  Mac sidebar                bg-muted  secondary buttons, hover
+ *   accent   ink: primary actions, selection, progress (inverted in dark mode)
+ */
+
+:root {
+  --canvas: #f7f4ee;
+  --sidebar: #efe9df;
+  --bg: #fffdf9;
+  --bg-subtle: #f6f2eb;
+  --bg-muted: #ebe5da;
+  --bg-emphasis: #e2dacd;
+  --border: #e6dfd3;
+  --border-strong: #d6ccbd;
+  --fg: #2b2622;
+  --fg-muted: #6f655b;
+  --fg-subtle: #a0958a;
+
+  --accent: #2b2622;
+  --accent-hover: #423a33;
+  --accent-fg: #fbf8f3;
+  --accent-subtle: #ece5d9;
+  --accent-subtle-fg: #2b2622;
+
+  --success: #3f8f5a;
+  --success-subtle: #e4f1e7;
+  --warning: #b7791f;
+  --warning-subtle: #faefd9;
+  --danger: #c2412d;
+  --danger-subtle: #f9e4df;
+
+  --overlay: rgb(43 38 34 / 32%);
+  --shadow-popover: 0 0 0 1px rgb(43 38 34 / 7%), 0 12px 32px -8px rgb(43 38 34 / 18%), 0 2px 6px -2px rgb(43 38 34 / 8%);
+  --shadow-dialog: 0 0 0 1px rgb(43 38 34 / 7%), 0 28px 56px -16px rgb(43 38 34 / 28%);
+  --shadow-control: 0 1px 1px rgb(43 38 34 / 5%);
+}
+
+.dark {
+  --canvas: #1b1916;
+  --sidebar: #211e1a;
+  --bg: #26221e;
+  --bg-subtle: #2b2722;
+  --bg-muted: #332e28;
+  --bg-emphasis: #3d372f;
+  --border: #37312a;
+  --border-strong: #4a4239;
+  --fg: #f3ede4;
+  --fg-muted: #b8ad9f;
+  --fg-subtle: #83796d;
+
+  --accent: #f3ede4;
+  --accent-hover: #ffffff;
+  --accent-fg: #1b1916;
+  --accent-subtle: #37312a;
+  --accent-subtle-fg: #f3ede4;
+
+  --success: #74c290;
+  --success-subtle: rgb(116 194 144 / 13%);
+  --warning: #e3ae5a;
+  --warning-subtle: rgb(227 174 90 / 13%);
+  --danger: #ea8a78;
+  --danger-subtle: rgb(234 138 120 / 13%);
+
+  --overlay: rgb(0 0 0 / 55%);
+  --shadow-popover: 0 0 0 1px rgb(255 255 255 / 6%), 0 14px 36px -8px rgb(0 0 0 / 60%);
+  --shadow-dialog: 0 0 0 1px rgb(255 255 255 / 7%), 0 30px 64px -16px rgb(0 0 0 / 70%);
+  --shadow-control: 0 1px 1px rgb(0 0 0 / 25%);
+}
+
+@theme inline {
+  /* Bundled with the app (see main.tsx), so phones get it from the Mac without internet. */
+  --font-sans: 'Plus Jakarta Sans Variable', -apple-system, BlinkMacSystemFont, system-ui, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, 'Roboto Mono', monospace;
+
+  --color-canvas: var(--canvas);
+  --color-sidebar: var(--sidebar);
+  --color-bg: var(--bg);
+  --color-bg-subtle: var(--bg-subtle);
+  --color-bg-muted: var(--bg-muted);
+  --color-bg-emphasis: var(--bg-emphasis);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-accent-subtle-fg: var(--accent-subtle-fg);
+  --color-success: var(--success);
+  --color-success-subtle: var(--success-subtle);
+  --color-warning: var(--warning);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-danger: var(--danger);
+  --color-danger-subtle: var(--danger-subtle);
+  --color-overlay: var(--overlay);
+
+  --shadow-popover: var(--shadow-popover);
+  --shadow-dialog: var(--shadow-dialog);
+  --shadow-control: var(--shadow-control);
+}
+
+/* Motion is limited to overlays and toasts appearing and disappearing. */
+@theme {
+  --animate-fade-in: fade-in 120ms ease-out;
+  --animate-fade-out: fade-out 100ms ease-in forwards;
+  --animate-pop-in: pop-in 120ms ease-out;
+  --animate-pop-out: fade-out 90ms ease-in forwards;
+  --animate-sheet-in: sheet-in 220ms cubic-bezier(0.32, 0.72, 0, 1);
+  --animate-sheet-out: sheet-out 160ms ease-in forwards;
+  --animate-toast-in: toast-in 200ms cubic-bezier(0.32, 0.72, 0, 1);
+  --animate-toast-out: fade-out 150ms ease-in forwards;
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+  }
+  @keyframes fade-out {
+    to {
+      opacity: 0;
+    }
+  }
+  @keyframes pop-in {
+    from {
+      opacity: 0;
+      transform: scale(0.98);
+    }
+  }
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.98);
+    }
+  }
+  @keyframes sheet-in {
+    from {
+      transform: translateY(100%);
+    }
+  }
+  @keyframes sheet-out {
+    to {
+      transform: translateY(100%);
+    }
+  }
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--border);
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent;
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    min-height: 100dvh;
+    background-color: var(--canvas);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.45;
+    letter-spacing: -0.003em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']) {
+    cursor: pointer;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+}
+
+/* Row actions appear on hover with a mouse; always visible on touch screens. */
+@utility reveal-on-hover {
+  @media (hover: hover) {
+    opacity: 0;
+    :where(.group):hover &,
+    :where(.group):focus-within & {
+      opacity: 1;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

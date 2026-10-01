@@ -1,0 +1,55 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "androiddrop",
+      "runtimeExecutable": "java",
+      "runtimeArgs": [
+        "-jar",
+        "backend/target/androiddrop-server-0.0.1-SNAPSHOT.jar",
+        "--drop.storage-dir=.dev-storage"
+      ],
+      "port": 8080
+    },
+    {
+      "name": "androiddrop-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "frontend"
+      ],
+      "port": 5173
+    },
+    {
+      "name": "androiddrop-preview-api",
+      "runtimeExecutable": "backend/mvnw",
+      "runtimeArgs": [
+        "-q",
+        "-f",
+        "backend/pom.xml",
+        "spring-boot:run",
+        "-Dspring-boot.run.arguments=--server.port=8090 --drop.storage-dir=/Users/prasadkasande/Developement/AndroidDrop/.dev-storage --drop.https-port=8453"
+      ],
+      "port": 8090
+    },
+    {
+      "name": "androiddrop-preview-web",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "VITE_API_TARGET=http://localhost:8090",
+        "npm",
+        "run",
+        "dev",
+        "--prefix",
+        "frontend",
+        "--",
+        "--port",
+        "5174",
+        "--strictPort"
+      ],
+      "port": 5174
+    }
+  ]
+}
