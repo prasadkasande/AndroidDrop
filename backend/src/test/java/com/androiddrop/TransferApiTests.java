@@ -234,6 +234,38 @@ class TransferApiTests extends ApiTestSupport {
 	}
 
 	@Test
+	void removingFromHistoryDeletesItsPreviews() throws Exception {
+		Cookie phone = pair("Pixel");
+		Sent sent = sendFile(phone, "host", "preview-me.png", "image/png", png());
+		mvc.perform(action(post("/api/transfers/{id}/accept", sent.id())));
+		mvc.perform(get("/api/transfers/{id}/files/{f}/thumbnail", sent.id(), sent.fileId())).andExpect(status().isOk());
+		Path thumbnail = STORAGE.resolve(".androiddrop/thumbs").resolve(sent.fileId() + ".jpg");
+		assertThat(thumbnail).exists();
+
+		mvc.perform(action(delete("/api/transfers/{id}", sent.id()))).andExpect(status().isNoContent());
+		assertThat(thumbnail).doesNotExist();
+		assertThat(STORAGE.resolve("preview-me.png")).exists();
+	}
+
+	@Test
+	void theOldestFinishedHistoryIsDroppedOnceThereIsTooMuch() throws Exception {
+		Device phone = deviceService.find(deviceId(pair("Pixel"))).orElseThrow();
+		Device host = deviceService.host();
+		String oldest = transferService.create(phone, host.id(), List.of(), "the oldest note").id();
+		transferService.decline(host, oldest);
+		String waiting = transferService.create(phone, host.id(), List.of(), "still waiting for an answer").id();
+		for (int i = 0; i < TransferService.MAX_HISTORY; i++) {
+			transferService.decline(host, transferService.create(phone, host.id(), List.of(), "note " + i).id());
+		}
+
+		transferService.expireAndClean();
+
+		List<String> kept = transferService.visibleTo(phone).stream().map(Transfer::id).toList();
+		assertThat(transferService.visibleTo(host).size()).isLessThanOrEqualTo(TransferService.MAX_HISTORY);
+		assertThat(kept).doesNotContain(oldest).contains(waiting);
+	}
+
+	@Test
 	void transfersShowTheSendersCurrentName() throws Exception {
 		Cookie phone = pair("Android phone");
 		MvcResult sent = mvc.perform(as(phone, json(post("/api/transfers"), "{\"recipientId\":\"host\",\"text\":\"hi\"}")))

@@ -42,7 +42,10 @@ function park(share) {
         db.close();
         resolve();
       };
-      transaction.onerror = () => reject(transaction.error);
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error);
+      };
     };
   });
 }

@@ -66,12 +66,22 @@ public class TransferService {
 	private static final long PROGRESS_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
 	/** How long files accepted by a phone wait on this computer for it to download them. */
 	private static final Duration UNCLAIMED_RETENTION = Duration.ofDays(1);
+	/**
+	 * Transfers kept in history. Beyond this the oldest finished ones are dropped, so a server left running for
+	 * months stays small.
+	 */
+	public static final int MAX_HISTORY = 1000;
 
 	/** What the sender announces for each file before uploading it. */
 	public record FileSpec(String name, long size, String mimeType) {
 	}
 
 	private final Map<String, Transfer> transfers = new ConcurrentHashMap<>();
+	/**
+	 * One lock per transfer, held while it changes. A change can be slow (a big file moved to a folder on another
+	 * disk is copied), and that should only hold up its own transfer.
+	 */
+	private final Map<String, Object> locks = new ConcurrentHashMap<>();
 	/** Files with an upload in progress; a second upload of the same file would write into the same part file. */
 	private final Set<String> receiving = ConcurrentHashMap.newKeySet();
 	private final Object fileNameLock = new Object();
@@ -155,9 +165,8 @@ public class TransferService {
 		if (autoAccept) {
 			transfer = deliverReadyFiles(transfer);
 		}
-		synchronized (this) {
-			transfers.put(id, transfer);
-		}
+		locks.put(id, new Object());
+		transfers.put(id, transfer);
 		events.publishEvent(new DropEvent.TransferChanged(transfer));
 		return transfer;
 	}
@@ -206,6 +215,7 @@ public class TransferService {
 			return update(transferId, current -> {
 				if (!current.status().isOpen()) {
 					deleteQuietly(staged);
+					deleteQuietly(staged.getParent());
 					return current;
 				}
 				Transfer next = current.withFile(file.with(State.READY, Instant.now()));
@@ -221,6 +231,7 @@ public class TransferService {
 			}
 			if (current == null) {
 				deleteQuietly(stagedPath(transferId, fileId));
+				deleteQuietly(storage.stagingDir().resolve(transferId));
 			}
 			throw ex;
 		}
@@ -296,14 +307,26 @@ public class TransferService {
 	 * storage folder are the user's now and are left alone.
 	 */
 	public void remove(Device me, String id) {
-		Transfer transfer = get(me, id);
-		synchronized (this) {
-			if (transfers.remove(id) == null) {
-				return;
-			}
+		forget(get(me, id).id());
+	}
+
+	private void forget(String id) {
+		Object lock = locks.get(id);
+		if (lock == null) {
+			return;
 		}
-		discardStaged(transfer);
-		events.publishEvent(new DropEvent.TransferRemoved(transfer));
+		Transfer removed;
+		synchronized (lock) {
+			removed = transfers.remove(id);
+			locks.remove(id);
+		}
+		if (removed == null) {
+			return;
+		}
+		discardStaged(removed);
+		// Previews of files saved into a folder go too: nothing shows them any more.
+		removed.files().forEach(file -> deleteThumbnail(file.id()));
+		events.publishEvent(new DropEvent.TransferRemoved(removed));
 	}
 
 	/**
@@ -379,7 +402,9 @@ public class TransferService {
 
 	public TransferView view(Transfer transfer) {
 		List<TransferView.FileView> files = transfer.files().stream().map(file -> {
-			boolean available = file.isStored() && Files.isRegularFile(contentPath(transfer, file));
+			// Only a saved file can go missing behind our back (moved or deleted in Finder); staged ones are ours.
+			boolean available = file.isStored()
+					&& (file.state() != State.SAVED || Files.isRegularFile(Path.of(file.storedPath())));
 			return new TransferView.FileView(file.id(), file.name(), file.size(), file.mimeType(), file.state(),
 					available, available && thumbnails.offers(file.id(), file.mimeType()), file.finishedAt());
 		}).toList();
@@ -390,8 +415,8 @@ public class TransferService {
 	}
 
 	/**
-	 * Expires unanswered transfers, and deletes the copies of files a phone has downloaded (after a short while, in
-	 * case it saves them again) or hasn't come back for.
+	 * Expires unanswered transfers, deletes the copies of files a phone has downloaded (after a short while, in case
+	 * it saves them again) or hasn't come back for, and drops the oldest history beyond {@link #MAX_HISTORY}.
 	 */
 	@Scheduled(fixedDelay = 1, timeUnit = TimeUnit.MINUTES)
 	public void expireAndClean() {
@@ -413,6 +438,16 @@ public class TransferService {
 					return file.with(State.REMOVED, now);
 				}));
 			}
+		}
+		int excess = transfers.size() - MAX_HISTORY;
+		if (excess > 0) {
+			transfers.values()
+				.stream()
+				.filter(transfer -> !transfer.status().isOpen() || transfer.isComplete())
+				.sorted(Comparator.comparing(Transfer::createdAt))
+				.limit(excess)
+				.toList()
+				.forEach(transfer -> forget(transfer.id()));
 		}
 	}
 
@@ -462,8 +497,16 @@ public class TransferService {
 		try {
 			Path target;
 			synchronized (fileNameLock) {
-				target = FileNames.uniqueIn(folder, file.name());
-				Files.move(stagedPath(transfer.id(), file.id()), target);
+				// Claims the name. The move itself happens outside the lock: onto another disk it's a copy, and other
+				// transfers shouldn't wait for that.
+				target = Files.createFile(FileNames.uniqueIn(folder, file.name()));
+			}
+			try {
+				Files.move(stagedPath(transfer.id(), file.id()), target, StandardCopyOption.REPLACE_EXISTING);
+			}
+			catch (IOException ex) {
+				deleteQuietly(target);
+				throw ex;
 			}
 			return file.savedAs(target.getFileName().toString(), target.toString(), Instant.now());
 		}
@@ -529,17 +572,23 @@ public class TransferService {
 		return transfer.withFiles(file -> file.state() == State.SAVED ? file : file.with(State.REMOVED, Instant.now()));
 	}
 
-	private synchronized Transfer update(String id, UnaryOperator<Transfer> change) {
-		Transfer current = transfers.get(id);
-		if (current == null) {
+	private Transfer update(String id, UnaryOperator<Transfer> change) {
+		Object lock = locks.get(id);
+		if (lock == null) {
 			throw new ResponseStatusException(HttpStatus.NOT_FOUND, "No such transfer.");
 		}
-		Transfer next = change.apply(current);
-		if (!next.equals(current)) {
-			transfers.put(id, next);
-			events.publishEvent(new DropEvent.TransferChanged(next));
+		synchronized (lock) {
+			Transfer current = transfers.get(id);
+			if (current == null) {
+				throw new ResponseStatusException(HttpStatus.NOT_FOUND, "No such transfer.");
+			}
+			Transfer next = change.apply(current);
+			if (!next.equals(current)) {
+				transfers.put(id, next);
+				events.publishEvent(new DropEvent.TransferChanged(next));
+			}
+			return next;
 		}
-		return next;
 	}
 
 	/** An upload in progress, or one that broke off and can be continued. */

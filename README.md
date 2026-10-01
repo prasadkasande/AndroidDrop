@@ -126,13 +126,15 @@ The server listens on your LAN, so it assumes other people on the network may be
 - **Host = loopback.** A request counts as coming from the Mac only if it arrives over `127.0.0.1`/`::1` *and* its
   `Host` header is `localhost`. The second check defeats DNS-rebinding pages.
 - **Everyone else must pair.** The 6-digit code is single use. It rotates after each pairing, after 5 wrong
-  guesses, and every 10 minutes. Pairing issues a random 256-bit token in an `HttpOnly; SameSite=Strict` cookie.
-  The server stores only its SHA-256 hash.
+  guesses, and every 10 minutes. A code used up by wrong guesses also pauses pairing (30 seconds, doubling up to
+  8 minutes while it keeps happening), so the codes can't be guessed through one after another. Pairing issues a
+  random 256-bit token in an `HttpOnly; SameSite=Strict` cookie. The server stores only its SHA-256 hash.
 - **CSRF.** Every state-changing request needs an `X-AndroidDrop` header, which cross-origin pages can't send
   without a CORS preflight that is never granted. Requests marked `Sec-Fetch-Site: cross-site` are rejected.
 - **Consent before saving.** Incoming files wait in a hidden staging folder until the recipient accepts. Declined,
   cancelled and expired transfers are deleted. A file sent to a phone is removed from the Mac an hour after the phone
-  downloaded it (a day if it never does).
+  downloaded it (a day if it never does); the phone's own copy can still be saved after that. History is capped at
+  the 1000 most recent transfers.
 - **Nothing outlives the server but pairings.** History, notes and links live in memory, and staged files, uploads in
   progress and thumbnails are deleted when the server stops. `~/AndroidDrop/.androiddrop` then holds only
   `devices.json` (paired devices and the Mac's preferences) and `tls/` (the HTTPS certificate). A phone drops its own
@@ -159,7 +161,7 @@ Set these in `backend/src/main/resources/application.properties` or pass them as
 | `drop.storage-dir` | `~/AndroidDrop` | Received files go here; server state goes in `.androiddrop/` |
 | `drop.host-name` | computer name | Name shown on phones |
 | `drop.pairing-code-ttl` | `10m` | |
-| `drop.max-pairing-attempts` | `5` | Wrong guesses before the code rotates |
+| `drop.max-pairing-attempts` | `5` | Wrong guesses before the code rotates and pairing pauses |
 | `drop.max-text-length` | `100000` | |
 | `drop.pending-transfer-ttl` | `1h` | How long a request waits for Accept/Decline before it expires |
 | `drop.delivered-retention` | `1h` | How long a file a phone downloaded stays on the Mac, for *Save again* |
@@ -225,7 +227,7 @@ All endpoints are under `/api`. Non-GET requests need `X-AndroidDrop: 1`.
 | `GET /transfers/{id}/files/{fileId}/content[?download=true]` | sender, or recipient after accepting | File bytes (Range supported). A phone recipient's download can resume (`Range: bytes=N-`) and marks the file delivered once complete |
 | `GET /transfers/{id}/files/{fileId}/thumbnail` | either end | Small cached JPEG preview (allowed before accepting) |
 | `POST /transfers/{id}/files/{fileId}/reveal` | host | Show in Finder |
-| `GET /events` | paired | SSE: `ready`, `transfer`, `transfer-removed`, `transfer-progress`, `transfer-delivery`, `devices`, `pairing` (host) |
+| `GET /events` | paired | SSE: `ready`, `transfer`, `transfer-removed`, `transfer-progress`, `transfer-delivery`, `devices`, `pairing` (host), and a `ping` every 20 seconds |
 | `GET /host/pairing`, `POST /host/pairing/rotate` | host | Code, expiry and LAN URLs for the QR |
 | `POST /host/open-folder` | host | Open `~/AndroidDrop` in Finder |
 | `GET /host/folders`, `PUT /host/folders/default` `{path}`, `POST /host/folders/choose` | host | Folders to save into; the default one; open the macOS folder picker |

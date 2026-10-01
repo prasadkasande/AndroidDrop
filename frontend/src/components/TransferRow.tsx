@@ -4,7 +4,7 @@ import { previewImageUrl, type SaveFolder, type Transfer, type TransferFile } fr
 import { cn } from '../lib/cn';
 import { formatBytes, fullDate, hostnameOf, previewKindOf, timeAgo } from '../lib/format';
 import { useDownloadedBytes, useFileProgress, useUploadedBytes, type ProgressStore } from '../lib/progress';
-import { keepsInApp, keptInApp, readyToSave, savedOf, useSavedFiles } from '../lib/phoneSave';
+import { keepsInApp, keptInApp, readyToSave, savedOf, useKeptFiles, useSavedFiles } from '../lib/phoneSave';
 import { describe, isStored, phaseOf, savableFiles, savedFolderName, singleLink, splitMedia, summarize, totalSize, type Phase } from '../lib/transfers';
 import { DeviceAvatar, type AvatarDevice } from './DeviceAvatar';
 import { FileTile } from './FileTile';
@@ -49,6 +49,8 @@ interface Props extends TransferActions {
 }
 
 const THUMB_LIMIT = 8;
+/** Files listed before "Show all": a transfer can hold hundreds, and every one of them redraws as the others arrive. */
+const FILE_LIMIT = 6;
 
 /** "A link to Pixel" rather than "a link to Pixel" when the row starts with it. */
 const capitalize = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
@@ -73,13 +75,15 @@ export const TransferRow = memo(function TransferRow(props: Props) {
   const canOpen = !incoming || accepted;
   const { media, other } = splitMedia(transfer.files);
   const thumbs = showAll ? media : media.slice(0, THUMB_LIMIT);
+  const rows = showAll ? other : other.slice(0, FILE_LIMIT);
   const firstSaved = transfer.files.find((file) => file.state === 'SAVED' && file.available);
   const allGone = transfer.files.length > 0 && transfer.files.every((file) => isStored(file.state) && !file.available);
   const inactive = phase === 'declined' || phase === 'cancelled' || phase === 'expired';
   const cancellable = !incoming && (phase === 'waiting' || phase === 'transferring' || phase === 'saving' || phase === 'failed');
   // Phone: received files wait in the app until the user saves them.
   const savedFiles = useSavedFiles();
-  const savable = keepsInApp && !isHost && incoming && phase === 'done' ? savableFiles(transfer) : [];
+  const keptFiles = useKeptFiles();
+  const savable = keepsInApp && !isHost && incoming && phase === 'done' ? savableFiles(transfer, keptFiles) : [];
   const savedCount = savedOf(savedFiles, savable).length;
   const saved = savable.length > 0 && savedCount === savable.length;
   const reconnecting = !incoming && transfer.files.some((file) => file.state === 'FAILED' && props.isUploading(file.id));
@@ -88,7 +92,7 @@ export const TransferRow = memo(function TransferRow(props: Props) {
       ? ({ tone: 'neutral', label: 'Moved or deleted' } as const)
       : phase === 'failed' && reconnecting
         ? ({ tone: 'accent', label: 'Reconnecting…' } as const)
-        : statusOf(phase, incoming, percent, peer, isHost, transfer, savedCount, savable.length);
+        : statusOf(phase, incoming, percent, peer, isHost, transfer, savedCount, savable.length, savedOf(savedFiles, transfer.files).length > 0);
   const target = folder ?? props.folders?.folders[0] ?? null;
 
   const copy = async () => {
@@ -251,9 +255,20 @@ export const TransferRow = memo(function TransferRow(props: Props) {
 
         {other.length > 0 && (
           <ul className={cn('mt-3 grid gap-2', other.length > 1 && 'sm:grid-cols-2 2xl:grid-cols-3')}>
-            {other.map((file) => (
+            {rows.map((file) => (
               <FileRow key={file.id} file={file} canOpen={canOpen} {...props} />
             ))}
+            {rows.length < other.length && (
+              <li className="flex">
+                <button
+                  type="button"
+                  onClick={() => setShowAll(true)}
+                  className="min-h-[58px] flex-1 rounded-lg border border-dashed border-border-strong px-3 text-[13px] font-medium text-fg-muted hover:bg-bg-muted hover:text-fg touch:rounded-xl touch:text-[15px]"
+                >
+                  Show all {other.length} files
+                </button>
+              </li>
+            )}
           </ul>
         )}
       </div>
@@ -314,6 +329,8 @@ function Thumb({
 function FileRow({ file, transfer, direction, isHost, fileManager, progressStore, canOpen, onReveal, onSave, onRetry, canRetry, isUploading, onPreview }: Props & { file: TransferFile; canOpen: boolean }) {
   const incoming = direction === 'in';
   const inDownloads = useSavedFiles().has(file.id);
+  // A copy in the app outlasts the computer's: it can still be saved after that one was cleaned up.
+  const inApp = useKeptFiles().has(file.id) && incoming && !isHost;
   const received = useFileProgress(progressStore, file.id, 'upload');
   const downloaded = useFileProgress(progressStore, file.id, 'download');
   const percent = file.size ? Math.floor((received / file.size) * 100) : 0;
@@ -338,12 +355,12 @@ function FileRow({ file, transfer, direction, isHost, fileManager, progressStore
     DELIVERED: incoming ? (keepsInApp && !inDownloads ? 'Not saved yet' : 'In Downloads') : 'Delivered',
     // The sender picks a broken-off upload up again where it stopped.
     FAILED: incoming ? 'Interrupted' : isUploading(file.id) ? 'Reconnecting…' : 'Upload failed',
-    REMOVED: 'No longer available',
+    REMOVED: inApp ? 'Not saved yet' : 'No longer available',
   }[file.state];
 
   return (
     <li className="flex min-w-0 items-center gap-3 rounded-lg border border-border bg-bg px-3 py-2.5 touch:rounded-xl touch:py-2 touch:pr-1.5">
-      <FileTile name={file.name} mimeType={file.mimeType} size="md" muted={file.state === 'REMOVED' || missing} />
+      <FileTile name={file.name} mimeType={file.mimeType} size="md" muted={(file.state === 'REMOVED' && !inApp) || missing} />
       <div className="min-w-0 flex-1">
         <p className="truncate text-[13px] font-medium touch:text-[15px]" title={file.name}>
           {file.name}
@@ -367,7 +384,7 @@ function FileRow({ file, transfer, direction, isHost, fileManager, progressStore
             </Button>
           </Tip>
         )}
-        {!isHost && incoming && canOpen && file.available && (file.state === 'READY' || file.state === 'DELIVERED') && (
+        {!isHost && incoming && canOpen && (inApp || (file.available && (file.state === 'READY' || file.state === 'DELIVERED'))) && (
           <Tip label="Save to Downloads">
             <Button variant="ghost" size="icon-xs" aria-label={`Save ${file.name}`} onClick={() => onSave(transfer, file)}>
               <Download />
@@ -395,6 +412,8 @@ function statusOf(
   transfer: Transfer,
   savedCount: number,
   savableCount: number,
+  /** Something of this transfer was put in Downloads from this browser. */
+  anySaved: boolean,
 ): { tone: 'neutral' | 'accent' | 'success' | 'warning' | 'danger'; label: string } {
   switch (phase) {
     case 'waiting':
@@ -411,6 +430,8 @@ function statusOf(
         if (savedCount === savableCount) return { tone: 'success', label: 'Saved to Downloads' };
         return { tone: 'accent', label: savedCount ? `Saved ${savedCount} of ${savableCount}` : 'Received · Not saved yet' };
       }
+      // Never saved, and neither the computer nor the app has it any more.
+      if (incoming && keepsInApp && !anySaved) return { tone: 'neutral', label: 'No longer available' };
       if (incoming) return { tone: 'success', label: 'Saved to Downloads' };
       return { tone: 'success', label: peer.host ? `Saved on ${peer.name}` : 'Delivered' };
     case 'failed':

@@ -54,8 +54,11 @@ public class Thumbnails {
 	/** Items that couldn't be decoded, so a list redrawing doesn't make the server try again every time. */
 	private final Set<String> undecodable = ConcurrentHashMap.newKeySet();
 
-	/** Decoding a photo is CPU- and memory-heavy; a list full of new photos shouldn't decode them all at once. */
-	private final Semaphore decoding = new Semaphore(Math.max(2, Runtime.getRuntime().availableProcessors()));
+	/**
+	 * Decoding a photo is CPU- and memory-heavy, and the server runs in a small heap: a list full of new photos is
+	 * decoded two at a time.
+	 */
+	private final Semaphore decoding = new Semaphore(2);
 
 	public Thumbnails(StorageLayout storage) {
 		this.dir = storage.thumbsDir();
@@ -96,8 +99,8 @@ public class Thumbnails {
 			Files.move(tmp, thumbnail, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 			return Optional.of(thumbnail);
 		}
-		catch (IOException | RuntimeException ex) {
-			// CMYK JPEGs, truncated uploads... the UI falls back to a file icon.
+		catch (IOException | RuntimeException | OutOfMemoryError ex) {
+			// CMYK JPEGs, truncated uploads, a panorama too big to decode... the UI falls back to a file icon.
 			log.debug("No thumbnail for {}: {}", source.getFileName(), ex.toString());
 			undecodable.add(itemId);
 			return Optional.empty();

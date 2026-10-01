@@ -5,7 +5,7 @@ import { copyText, fileManagerName, tildePath } from '../lib/format';
 import { ProgressStore } from '../lib/progress';
 import { isComplete, isOpen, savableFiles, singleLink, sortNewestFirst, summarize } from '../lib/transfers';
 import { UploadQueue } from '../lib/uploads';
-import { forgetCopies, forgetIfServerRestarted, keepsInApp, saveToPhone, unsavedOf } from '../lib/phoneSave';
+import { forgetCopies, forgetIfServerRestarted, keepsInApp, keptFiles, pruneCopies, saveToPhone, unsavedOf } from '../lib/phoneSave';
 import { useAutoSave } from '../lib/useAutoSave';
 import { takeParam } from '../lib/secure';
 import { takeShare } from '../lib/shareInbox';
@@ -63,6 +63,9 @@ export function Home({ session, secureSetup, onSessionChange, onUnpaired }: Prop
   // Not subscribed here: rows that show progress subscribe themselves, so uploads don't re-render the whole app.
   const [progressStore] = useState(() => new ProgressStore());
   const transfersRef = useRef(transfers);
+  /** Transfers changed (or, with null, removed) by live events while a sync is fetching: newer than what it returns. */
+  const changedDuringSync = useRef<Map<string, Transfer | null> | null>(null);
+  const loadedRef = useRef(false);
   const knownDeviceIds = useRef<Set<string> | null>(null);
   const pickFor = useRef<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -139,14 +142,32 @@ export function Home({ session, secureSetup, onSessionChange, onUnpaired }: Prop
 
   const sync = useCallback(async () => {
     loadFolders();
+    const changed = new Map<string, Transfer | null>();
+    changedDuringSync.current = changed;
     try {
-      const [nextTransfers, nextDevices, nextSession] = await Promise.all([api.transfers(), api.devices(), api.session()]);
+      const [fetched, nextDevices, nextSession] = await Promise.all([api.transfers(), api.devices(), api.session()]);
+      // An event that arrived while this was fetching is newer than the list, and must not be undone by it.
+      const fetchedIds = new Set(fetched.map((transfer) => transfer.id));
+      const nextTransfers = [
+        ...[...changed.values()].filter((transfer) => transfer !== null && !fetchedIds.has(transfer.id)),
+        ...fetched.filter((transfer) => changed.get(transfer.id) !== null).map((transfer) => changed.get(transfer.id) ?? transfer),
+      ] as Transfer[];
+      transfersRef.current = nextTransfers;
       setTransfers(nextTransfers);
       applyDevices(nextDevices);
       onSessionChange(nextSession);
       setLoaded(true);
+      if (!loadedRef.current && !nextSession.host) {
+        const received = nextTransfers
+          .filter((transfer) => transfer.recipientId === nextSession.device.id && transfer.status === 'ACCEPTED')
+          .flatMap((transfer) => transfer.files.map((file) => [file.id, file.size] as const));
+        void pruneCopies(new Map(received));
+      }
+      loadedRef.current = true;
     } catch (error) {
       fail(error);
+    } finally {
+      if (changedDuringSync.current === changed) changedDuringSync.current = null;
     }
   }, [applyDevices, fail, loadFolders, onSessionChange]);
 
@@ -195,25 +216,30 @@ export function Home({ session, secureSetup, onSessionChange, onUnpaired }: Prop
       // Update the ref now, not after the next render: events for one transfer often arrive back to back, and each
       // must see the one before it, or both look new and are announced twice.
       transfersRef.current = withTransfer(transfersRef.current, transfer);
+      changedDuringSync.current?.set(transfer.id, transfer);
       upsert(transfer);
-      announce(previous, transfer);
+      // Before the first load every transfer looks new; only what changes after that is news.
+      if (loadedRef.current) announce(previous, transfer);
       // Accepted into a picked folder (maybe in another tab): it's one of the recent folders now.
       if (transfer.folder && transfer.folder !== previous?.folder) loadFolders();
       if (!isOpen(transfer)) uploads.drop(transfer.id);
       const fileIds = transfer.files.map((file) => file.id);
-      if (!transfer.files.some((file) => file.state === 'UPLOADING')) {
-        progressStore.finish('upload', transfer.id, fileIds);
-        uploads.release(transfer.id);
-      }
+      if (!transfer.files.some((file) => file.state === 'UPLOADING')) progressStore.finish('upload', transfer.id, fileIds);
+      // The picked files are kept while any of them failed, so it can be sent again by hand.
+      if (!transfer.files.some((file) => file.state === 'UPLOADING' || file.state === 'FAILED')) uploads.release(transfer.id);
       if (!transfer.files.some((file) => file.state === 'READY')) progressStore.finish('download', transfer.id, fileIds);
     },
     'transfer-removed': ({ id }) => {
+      changedDuringSync.current?.set(id, null);
       uploads.drop(id);
       // Removed from history: a phone's copies of its files go too, and toasts about it.
       const removed = transfersRef.current.find((transfer) => transfer.id === id);
       if (removed && !isHost) void forgetCopies(removed.files);
       toast.dismiss(`save-${id}`);
       toast.dismiss(`saved-${id}`);
+      transfersRef.current = transfersRef.current.filter((transfer) => transfer.id !== id);
+      progressStore.finish('upload', id, removed?.files.map((file) => file.id) ?? []);
+      progressStore.finish('download', id, removed?.files.map((file) => file.id) ?? []);
       setTransfers((list) => list.filter((transfer) => transfer.id !== id));
       setPreview((current) => (current?.transfer.id === id ? null : current));
     },
@@ -252,7 +278,7 @@ export function Home({ session, secureSetup, onSessionChange, onUnpaired }: Prop
   const saveAll = useCallback(
     (transfer: Transfer) => {
       const latest = transfersRef.current.find((existing) => existing.id === transfer.id) ?? transfer;
-      const files = savableFiles(latest);
+      const files = savableFiles(latest, keptFiles());
       const unsaved = unsavedOf(files);
       saveOnPhone(latest, unsaved.length ? unsaved : files);
     },

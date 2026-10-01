@@ -82,7 +82,8 @@ public class EventHub {
 
 	@Scheduled(fixedRate = 20, timeUnit = TimeUnit.SECONDS)
 	void heartbeat() {
-		clients.forEach(client -> send(client, () -> SseEmitter.event().comment("ping")));
+		// A named event rather than a comment, so a page can tell a quiet stream from one that died without a word.
+		clients.forEach(client -> send(client, () -> SseEmitter.event().name("ping").data("")));
 	}
 
 	/** Close streams up front so graceful shutdown doesn't wait on them. */

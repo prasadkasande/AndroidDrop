@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { ArrowUp, Check, Copy, Paperclip, Plus, X } from 'lucide-react';
 import type { Device, PairingInfo, Session, Transfer } from '../lib/api';
 import { cn } from '../lib/cn';
@@ -184,7 +184,8 @@ const FAILED_MS = 10 * 60 * 1000;
 
 /** File transfers in flight in either direction, plus ones that just finished or were declined. Notes and links show in Messages. */
 function LiveTransfers({ session, transfers, progressStore, peerOf, onCancel, isUploading }: Props) {
-  const now = useNow(1000);
+  const [, tick] = useReducer((count: number) => count + 1, 0);
+  const now = Date.now();
   const me = session.device.id;
   const recent = (iso: string | null) => iso !== null && now - Date.parse(iso) < LINGER_MS;
   const live = transfers.filter((transfer) => {
@@ -200,6 +201,13 @@ function LiveTransfers({ session, transfers, progressStore, peerOf, onCancel, is
     const finished = transfer.files.reduce((latest, file) => Math.max(latest, Date.parse(file.finishedAt ?? '') || 0), 0);
     return now - finished < LINGER_MS;
   });
+  // Finished transfers linger a few seconds, so the list is looked at again every second, but only while it shows any.
+  const showing = live.length > 0;
+  useEffect(() => {
+    if (!showing) return;
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [showing]);
   if (!live.length) return null;
   return (
     <Panel title="In progress">

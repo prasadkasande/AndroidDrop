@@ -56,12 +56,17 @@ export function TransfersView({ session, direction, transfers, devices, progress
       const peer = incoming ? transfer.senderName : transfer.recipientName;
       return [summarize(transfer), peer, transfer.text ?? '', ...transfer.files.map((file) => file.name)].some((field) => field.toLowerCase().includes(needle));
     });
-    const pending = incoming ? matches.filter((transfer) => transfer.status === 'PENDING') : [];
+    const pending: Transfer[] = [];
     const byDay = new Map<string, Transfer[]>();
     for (const transfer of matches) {
-      if (pending.includes(transfer)) continue;
+      if (incoming && transfer.status === 'PENDING') {
+        pending.push(transfer);
+        continue;
+      }
       const label = dayLabel(transfer.createdAt, now);
-      byDay.set(label, [...(byDay.get(label) ?? []), transfer]);
+      const day = byDay.get(label);
+      if (day) day.push(transfer);
+      else byDay.set(label, [transfer]);
     }
     return { requests: pending, groups: [...byDay.entries()] };
   }, [transfers, query, incoming, now]);

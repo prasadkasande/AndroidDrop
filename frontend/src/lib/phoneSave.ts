@@ -60,6 +60,7 @@ export async function fetchIntoApp(transfer: Transfer, file: TransferFile): Prom
     void dir.removeEntry(file.id).catch(() => {});
     throw error;
   }
+  setKept(new Set(kept).add(file.id));
 }
 
 /** The browser's own download, straight from the host. Used when the app can't keep files itself. */
@@ -119,7 +120,7 @@ export async function forgetIfServerRestarted(run: string) {
   } catch {
     // Nothing stored.
   }
-  listeners.forEach((listener) => listener());
+  setKept(new Set());
   if (!keepsInApp) return;
   clearing = navigator.storage
     .getDirectory()
@@ -130,6 +131,37 @@ export async function forgetIfServerRestarted(run: string) {
   await clearing;
 }
 
+/**
+ * Takes stock of the copies in the app, once per visit. Ones already put in Downloads (the page was closed before
+ * they were cleaned up) and ones whose transfer is gone are deleted. `received` is every file of the transfers this
+ * phone accepted, with its size; the whole copies among them are what {@link useKeptFiles} then reports.
+ */
+export async function pruneCopies(received: ReadonlyMap<string, number>) {
+  if (!keepsInApp) return;
+  try {
+    await clearing;
+    const dir = await folder();
+    const names: string[] = [];
+    for await (const name of dir.keys()) names.push(name);
+    const whole: string[] = [];
+    await Promise.all(
+      names.map(async (name) => {
+        const size = received.get(name);
+        if (size === undefined || saved.has(name)) {
+          await dir.removeEntry(name).catch(() => {});
+          return;
+        }
+        // A copy that's short is being fetched right now, or was cut off; fetching it again replaces it.
+        const copy = await dir.getFileHandle(name).then((handle) => handle.getFile(), () => null);
+        if (copy?.size === size) whole.push(name);
+      }),
+    );
+    setKept(new Set([...kept, ...whole]));
+  } catch {
+    // Storage unavailable.
+  }
+}
+
 /** Deletes this phone's copies of `files`, if it has any. */
 export async function forgetCopies(files: TransferFile[]) {
   if (!keepsInApp) return;
@@ -138,6 +170,10 @@ export async function forgetCopies(files: TransferFile[]) {
     await Promise.all(files.map((file) => dir.removeEntry(file.id).catch(() => {})));
   } catch {
     // Storage unavailable.
+  }
+  if (files.some((file) => kept.has(file.id))) {
+    const gone = new Set(files.map((file) => file.id));
+    setKept(new Set([...kept].filter((id) => !gone.has(id))));
   }
 }
 
@@ -163,9 +199,28 @@ function handOver(href: string, name: string) {
   link.remove();
 }
 
-// Which files the user has saved, so the list can say so. Only this browser needs to know.
+// Which files the user has saved, so the list can say so, and which have a copy in the app. Only this browser
+// needs to know.
 const listeners = new Set<() => void>();
 let saved: ReadonlySet<string> = readSaved();
+let kept: ReadonlySet<string> = new Set();
+
+function setKept(next: ReadonlySet<string>) {
+  kept = next;
+  listeners.forEach((listener) => listener());
+}
+
+const subscribe = (listener: () => void) => {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+};
+
+/** Files with a whole copy in the app. They can be saved even after the computer has deleted its own copy. */
+export const keptFiles = () => kept;
+
+export function useKeptFiles(): ReadonlySet<string> {
+  return useSyncExternalStore(subscribe, keptFiles);
+}
 
 function readSaved(): ReadonlySet<string> {
   try {
@@ -193,16 +248,9 @@ export function savedOf(saved: ReadonlySet<string>, files: TransferFile[]): Tran
 
 /** Which of `files` still need saving, as of now. */
 export function unsavedOf(files: TransferFile[]): TransferFile[] {
-  const done = savedOf(saved, files);
-  return files.filter((file) => !done.includes(file));
+  return files.filter((file) => !saved.has(file.id));
 }
 
 export function useSavedFiles(): ReadonlySet<string> {
-  return useSyncExternalStore(
-    (listener) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
-    () => saved,
-  );
+  return useSyncExternalStore(subscribe, () => saved);
 }

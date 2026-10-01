@@ -106,9 +106,14 @@ export function phaseOf(transfer: Transfer): Phase {
   return 'done';
 }
 
-/** A phone recipient's files it can save: received, and still on the host. */
-export function savableFiles(transfer: Transfer): TransferFile[] {
-  return transfer.files.filter((file) => file.available && (file.state === 'READY' || file.state === 'DELIVERED'));
+const NONE: ReadonlySet<string> = new Set();
+
+/**
+ * A phone recipient's files it can save: received and still on the host, or with a copy in the app (`kept`), which
+ * outlasts the host's own.
+ */
+export function savableFiles(transfer: Transfer, kept: ReadonlySet<string> = NONE): TransferFile[] {
+  return transfer.files.filter((file) => kept.has(file.id) || (file.available && (file.state === 'READY' || file.state === 'DELIVERED')));
 }
 
 /** The folder a host recipient saved into: the one picked when accepting, or AndroidDrop. */

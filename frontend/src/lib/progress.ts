@@ -24,7 +24,7 @@ const bytesOf: Record<Leg, (transfer: Transfer, progress: ReadonlyMap<string, nu
  * several updates a second only re-render what shows that particular transfer.
  */
 export class ProgressStore {
-  private files: Record<Leg, Map<string, number>> = { upload: new Map(), download: new Map() };
+  private readonly files: Record<Leg, Map<string, number>> = { upload: new Map(), download: new Map() };
   private speeds = new Map<string, number>();
   private samples = new Map<string, Sample>();
   private readonly listeners = new Set<() => void>();
@@ -46,7 +46,7 @@ export class ProgressStore {
 
   /** Records how far one file of `transfer` has got. */
   update(leg: Leg, transfer: Transfer, fileId: string, bytes: number) {
-    this.files = { ...this.files, [leg]: new Map(this.files[leg]).set(fileId, bytes) };
+    this.files[leg].set(fileId, bytes);
     const key = `${leg}:${transfer.id}`;
     const transferBytes = bytesOf[leg](transfer, this.files[leg]);
     const now = performance.now();
@@ -68,9 +68,7 @@ export class ProgressStore {
     if (!this.samples.has(key) && fileIds.every((id) => !this.files[leg].has(id))) return;
     this.samples.delete(key);
     this.speeds.delete(key);
-    const next = new Map(this.files[leg]);
-    for (const id of fileIds) next.delete(id);
-    this.files = { ...this.files, [leg]: next };
+    for (const id of fileIds) this.files[leg].delete(id);
     this.emit();
   }
 
