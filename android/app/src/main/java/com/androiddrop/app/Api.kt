@@ -8,7 +8,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okio.BufferedSink
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
@@ -87,14 +89,11 @@ fun parseTransfer(json: JSONObject): Transfer {
  */
 class ApiClient(val baseUrl: String, private val token: String?) {
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
-
-    /** For the event stream, which stays open and is quiet between events. */
-    val streaming: OkHttpClient = http.newBuilder().readTimeout(0, TimeUnit.SECONDS).build()
+    /**
+     * For the event stream, which stays open. The computer pings it every 20 seconds, so one that stays silent for
+     * longer has died without a word (the computer went to sleep, the phone changed Wi-Fi) and is given up.
+     */
+    val streaming: OkHttpClient get() = STREAMING
 
     fun request(path: String): Request.Builder {
         val builder = Request.Builder()
@@ -107,23 +106,34 @@ class ApiClient(val baseUrl: String, private val token: String?) {
 
     private fun execute(request: Request): Response {
         val response = try {
-            http.newCall(request).execute()
+            HTTP.newCall(request).execute()
         } catch (error: IOException) {
-            throw ApiException(0, "Can't reach the computer. Is AndroidDrop running, and are you on the same Wi-Fi?")
+            throw ApiException(0, UNREACHABLE)
         }
         if (response.isSuccessful) return response
-        val body = response.body?.string().orEmpty()
-        response.close()
+        val body = response.use(::text)
         val detail = runCatching { JSONObject(body).optString("detail") }.getOrNull().orEmpty()
         throw ApiException(response.code, detail.ifEmpty { "Request failed (${response.code})" })
     }
 
     private fun call(method: String, path: String, body: JSONObject? = null): String {
         val payload = body?.toString()?.toRequestBody(JSON) ?: if (method == "GET") null else ByteArray(0).toRequestBody(null)
-        return execute(request(path).method(method, payload).build()).use { it.body?.string().orEmpty() }
+        return execute(request(path).method(method, payload).build()).use(::text)
     }
 
-    fun serverName(): String = JSONObject(call("GET", "/api/server")).getString("name")
+    /** The reply's text. A connection that drops halfway through it counts as not reaching the computer. */
+    private fun text(response: Response): String = try {
+        response.body?.string().orEmpty()
+    } catch (error: IOException) {
+        throw ApiException(0, UNREACHABLE)
+    }
+
+    /** Whatever answered wasn't AndroidDrop (another device now has that address, or a Wi-Fi sign-in page). */
+    private inline fun <T> reply(parse: () -> T): T = try {
+        parse()
+    } catch (error: JSONException) {
+        throw ApiException(0, "That address answered, but not as AndroidDrop. Check you're on the same Wi-Fi as the computer.")
+    }
 
     /** Pairs this phone. Returns the token to keep, and who we now are. */
     fun pair(code: String, name: String): Pair<String, JSONObject> {
@@ -132,24 +142,24 @@ class ApiClient(val baseUrl: String, private val token: String?) {
             val cookie = response.headers("Set-Cookie").firstOrNull { it.startsWith("$TOKEN_COOKIE=") }
                 ?: throw ApiException(500, "The computer didn't send a pairing token.")
             val token = cookie.substringAfter('=').substringBefore(';')
-            return token to JSONObject(response.body?.string().orEmpty())
+            return token to reply { JSONObject(text(response)) }
         }
     }
 
-    fun session(): JSONObject = JSONObject(call("GET", "/api/session"))
+    fun session(): JSONObject = reply { JSONObject(call("GET", "/api/session")) }
 
-    fun devices(): List<Device> = JSONArray(call("GET", "/api/devices")).let { list -> (0 until list.length()).map { parseDevice(list.getJSONObject(it)) } }
+    fun devices(): List<Device> = reply { JSONArray(call("GET", "/api/devices")).let { list -> (0 until list.length()).map { parseDevice(list.getJSONObject(it)) } } }
 
-    fun transfers(): List<Transfer> = JSONArray(call("GET", "/api/transfers")).let { list -> (0 until list.length()).map { parseTransfer(list.getJSONObject(it)) } }
+    fun transfers(): List<Transfer> = reply { JSONArray(call("GET", "/api/transfers")).let { list -> (0 until list.length()).map { parseTransfer(list.getJSONObject(it)) } } }
 
-    fun rename(name: String): JSONObject = JSONObject(call("PATCH", "/api/session", JSONObject().put("name", name)))
+    fun rename(name: String): JSONObject = reply { JSONObject(call("PATCH", "/api/session", JSONObject().put("name", name))) }
 
-    fun setAutoAccept(value: Boolean): JSONObject = JSONObject(call("PATCH", "/api/session/preferences", JSONObject().put("autoAccept", value)))
+    fun setAutoAccept(value: Boolean): JSONObject = reply { JSONObject(call("PATCH", "/api/session/preferences", JSONObject().put("autoAccept", value))) }
 
     /** A small JPEG preview of a photo, or null if there isn't one. */
     fun thumbnail(transferId: String, fileId: String): ByteArray? = try {
         execute(request("/api/transfers/$transferId/files/$fileId/thumbnail").get().build()).use { it.body?.bytes() }
-    } catch (error: ApiException) {
+    } catch (error: IOException) {
         null
     }
 
@@ -160,13 +170,13 @@ class ApiClient(val baseUrl: String, private val token: String?) {
     fun announce(recipientId: String, files: List<OutgoingFile>): Transfer {
         val list = JSONArray()
         files.forEach { list.put(JSONObject().put("name", it.name).put("size", it.size).put("mimeType", it.mimeType)) }
-        return parseTransfer(JSONObject(call("POST", "/api/transfers", JSONObject().put("recipientId", recipientId).put("files", list))))
+        return reply { parseTransfer(JSONObject(call("POST", "/api/transfers", JSONObject().put("recipientId", recipientId).put("files", list)))) }
     }
 
     fun sendText(recipientId: String, text: String): Transfer =
-        parseTransfer(JSONObject(call("POST", "/api/transfers", JSONObject().put("recipientId", recipientId).put("text", text))))
+        reply { parseTransfer(JSONObject(call("POST", "/api/transfers", JSONObject().put("recipientId", recipientId).put("text", text)))) }
 
-    fun act(transferId: String, action: String): Transfer = parseTransfer(JSONObject(call("POST", "/api/transfers/$transferId/$action")))
+    fun act(transferId: String, action: String): Transfer = reply { parseTransfer(JSONObject(call("POST", "/api/transfers/$transferId/$action"))) }
 
     fun remove(transferId: String) {
         call("DELETE", "/api/transfers/$transferId")
@@ -174,7 +184,7 @@ class ApiClient(val baseUrl: String, private val token: String?) {
 
     /** How much of a broken-off upload the computer kept. */
     fun received(transferId: String, fileId: String): Long =
-        JSONObject(call("GET", "/api/transfers/$transferId/files/$fileId/received")).getLong("received")
+        reply { JSONObject(call("GET", "/api/transfers/$transferId/files/$fileId/received")).getLong("received") }
 
     /** Uploads a file from byte [offset] on, streaming it from [open]. */
     fun upload(transferId: String, fileId: String, size: Long, offset: Long, open: () -> InputStream): Transfer {
@@ -204,17 +214,17 @@ class ApiClient(val baseUrl: String, private val token: String?) {
         val request = request("/api/transfers/$transferId/files/$fileId$query").put(body).build()
         // No overall deadline: a big video takes as long as it takes. A stalled connection still times out.
         val response = try {
-            http.newCall(request).execute()
+            HTTP.newCall(request).execute()
         } catch (error: IOException) {
             throw ApiException(0, "Connection lost during upload.")
         }
         response.use {
-            val text = it.body?.string().orEmpty()
+            val text = text(it)
             if (!it.isSuccessful) {
                 val detail = runCatching { JSONObject(text).optString("detail") }.getOrNull().orEmpty()
                 throw ApiException(it.code, detail.ifEmpty { "Upload failed (${it.code})" })
             }
-            return parseTransfer(JSONObject(text))
+            return reply { parseTransfer(JSONObject(text)) }
         }
     }
 
@@ -228,9 +238,21 @@ class ApiClient(val baseUrl: String, private val token: String?) {
     companion object {
         const val TOKEN_COOKIE = "adrop_token"
         const val USER_AGENT = "AndroidDrop/0.1 (Linux; Android)"
+        private const val UNREACHABLE = "Can't reach the computer. Is AndroidDrop running, and are you on the same Wi-Fi?"
         private val JSON = "application/json".toMediaType()
+
+        /** One client for the whole app, so its connections and threads are shared rather than made per pairing. */
+        private val HTTP = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .build()
+        private val STREAMING = HTTP.newBuilder().readTimeout(50, TimeUnit.SECONDS).build()
     }
 }
 
-/** A file about to be sent, read from wherever the phone's picker or another app pointed. */
-class OutgoingFile(val name: String, val size: Long, val mimeType: String, val open: () -> InputStream)
+/**
+ * A file about to be sent, read from wherever the phone's picker or another app pointed. [temporary] is the copy
+ * made of something that could only be read once, to delete when it has been sent.
+ */
+class OutgoingFile(val name: String, val size: Long, val mimeType: String, val temporary: File? = null, val open: () -> InputStream)

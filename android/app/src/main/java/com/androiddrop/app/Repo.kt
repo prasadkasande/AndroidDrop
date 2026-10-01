@@ -1,5 +1,6 @@
 package com.androiddrop.app
 
+import android.app.Activity
 import android.app.Application
 import android.content.ContentValues
 import android.content.Context
@@ -7,12 +8,16 @@ import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.Log
 import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -41,6 +46,25 @@ class DropApp : Application() {
         super.onCreate()
         repo = Repo(this)
         repo.start()
+        // The connection to the computer follows the screen: there while the app is in view, gone soon after it isn't.
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            private var started = 0
+
+            override fun onActivityStarted(activity: Activity) {
+                if (started++ == 0) repo.setForeground(true)
+            }
+
+            override fun onActivityStopped(activity: Activity) {
+                // A rotating screen stops one activity and starts the next; that isn't leaving.
+                if (--started == 0 && !activity.isChangingConfigurations) repo.setForeground(false)
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityResumed(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+        })
     }
 }
 
@@ -51,19 +75,27 @@ class DropApp : Application() {
 class Repo(private val app: Application) {
 
     private val prefs = app.getSharedPreferences("androiddrop", Context.MODE_PRIVATE)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Short messages for the user. */
+    val notices = MutableSharedFlow<String>(extraBufferCapacity = 16)
+
+    /** Nothing that goes wrong in the background may take the app down: what isn't handled where it happens ends up here. */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error ->
+        Log.w("AndroidDrop", "Unexpected failure", error)
+        notices.tryEmit("Something went wrong. Try that again.")
+    })
 
     val paired = MutableStateFlow(prefs.getString(KEY_TOKEN, null) != null)
     val me = MutableStateFlow<Device?>(null)
     val serverName = MutableStateFlow(prefs.getString(KEY_SERVER, "").orEmpty())
     val devices = MutableStateFlow<List<Device>>(emptyList())
     val transfers = MutableStateFlow<List<Transfer>>(emptyList())
-    /** Bytes so far per file id: uploads to the computer, and downloads from it. */
+    /** Bytes so far per file id, for files on the move: uploads to the computer, and downloads from it. */
     val uploaded = MutableStateFlow<Map<String, Long>>(emptyMap())
     val downloaded = MutableStateFlow<Map<String, Long>>(emptyMap())
     val connected = MutableStateFlow(false)
-    /** Short messages for the user. */
-    val notices = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    /** Uploads and downloads under way. While there are any, the connection is kept and the screen stays on. */
+    val working = MutableStateFlow(0)
     /** Files or text shared in from another app, waiting for a recipient to be picked. */
     val pendingShare = MutableStateFlow<Share?>(null)
 
@@ -78,23 +110,40 @@ class Repo(private val app: Application) {
     /** Where each received file was saved, to open it from the list. Until the app closes. */
     val savedFiles = MutableStateFlow<Map<String, Uri>>(emptyMap())
 
-    private val previews = LruCache<String, ImageBitmap>(80)
+    /** Photo previews, up to 8 MB of them. */
+    private val previews = object : LruCache<String, ImageBitmap>(8 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: ImageBitmap) = value.width * value.height * 4
+    }
     private val unsaved = ConcurrentHashMap<String, IntArray>()
 
+    @Volatile
     private var api: ApiClient? = null
     private var stream: EventSource? = null
     /** Bumped whenever the connection is replaced, so an old stream's callbacks are ignored. */
+    @Volatile
     private var generation = 0
+    @Volatile
+    private var foreground = false
+    private var retryPause = RETRY_MS
+    /** Changes that live events made while [sync] was fetching: they are newer than what it brings back. */
+    private var syncing: SyncWindow? = null
+    private val listLock = Any()
     private val uploads = Mutex()
     private val downloads = Mutex()
     private val fetching = ConcurrentHashMap.newKeySet<String>()
     private val cancelled = ConcurrentHashMap.newKeySet<String>()
 
+    private class SyncWindow {
+        val changed = HashMap<String, Transfer>()
+        val removed = HashSet<String>()
+    }
+
     fun start() {
+        // Copies of shared files left behind when the app was closed mid-upload.
+        scope.launch { app.cacheDir.listFiles { file -> file.name.startsWith(SHARE_PREFIX) }?.forEach { it.delete() } }
         val token = prefs.getString(KEY_TOKEN, null) ?: return
         val address = prefs.getString(KEY_ADDRESS, null) ?: return
         api = ApiClient(address, token)
-        connect()
     }
 
     // ---------- Pairing ----------
@@ -120,15 +169,26 @@ class Repo(private val app: Application) {
         forgetPairing()
     }
 
+    /** The computer no longer knows this phone. */
+    private fun unpaired() {
+        notices.tryEmit("This phone was removed from ${serverName.value}. Pair it again.")
+        forgetPairing()
+    }
+
+    @Synchronized
     private fun forgetPairing() {
         generation++
         stream?.cancel()
         stream = null
         api = null
         prefs.edit().remove(KEY_TOKEN).apply()
+        // Whatever is still uploading or downloading stops at its next step.
+        transfers.value.forEach { cancelled.add(it.id) }
         connected.value = false
         transfers.value = emptyList()
         devices.value = emptyList()
+        uploaded.value = emptyMap()
+        downloaded.value = emptyMap()
         me.value = null
         paired.value = false
     }
@@ -137,17 +197,18 @@ class Repo(private val app: Application) {
 
     // ---------- Settings ----------
 
-    fun rename(name: String) = setting { client -> client.rename(name.trim()) }
+    fun rename(name: String) = request { client -> applySession(client.rename(name.trim())) }
 
-    fun setAutoAccept(value: Boolean) = setting { client -> client.setAutoAccept(value) }
+    fun setAutoAccept(value: Boolean) = request { client -> applySession(client.setAutoAccept(value)) }
 
-    private fun setting(change: (ApiClient) -> JSONObject) {
+    /** Asks the computer for something off the main thread, telling the user if it refuses or can't be reached. */
+    private fun request(ask: suspend (ApiClient) -> Unit) {
         val client = api ?: return
         scope.launch {
             try {
-                applySession(change(client))
+                ask(client)
             } catch (error: ApiException) {
-                notices.tryEmit(error.message.orEmpty())
+                if (error.status == 401) unpaired() else notices.tryEmit(error.message.orEmpty())
             }
         }
     }
@@ -180,6 +241,9 @@ class Repo(private val app: Application) {
         return id.substringAfter(':').ifEmpty { "Internal storage" }
     }
 
+    /** A photo's preview if it was fetched before: there straight away, without leaving the main thread. */
+    fun cachedPreview(fileId: String): ImageBitmap? = previews.get(fileId)
+
     /** A photo's small preview, fetched once and kept in memory. Blocks: call off the main thread. */
     fun preview(transferId: String, fileId: String): ImageBitmap? {
         previews.get(fileId)?.let { return it }
@@ -191,6 +255,40 @@ class Repo(private val app: Application) {
 
     // ---------- Live connection ----------
 
+    /**
+     * The app came into view, or left it. Out of view, the connection is only kept while files are moving: a phone
+     * that kept reaching for a computer it has walked away from would wear its battery down for nothing.
+     */
+    fun setForeground(value: Boolean) {
+        foreground = value
+        if (value) {
+            wake()
+        } else {
+            // Not at once: an answer to something just tapped (an accepted transfer starting) may still be on its way.
+            scope.launch {
+                delay(LINGER_MS)
+                rest()
+            }
+        }
+    }
+
+    @Synchronized
+    private fun wake() {
+        retryPause = RETRY_MS
+        if (stream == null) connect()
+    }
+
+    /** Drops the connection if nothing needs it. */
+    @Synchronized
+    private fun rest() {
+        if (foreground || working.value > 0 || stream == null) return
+        generation++
+        stream?.cancel()
+        stream = null
+        connected.value = false
+    }
+
+    @Synchronized
     private fun connect() {
         val client = api ?: return
         val current = ++generation
@@ -202,41 +300,52 @@ class Repo(private val app: Application) {
                 runCatching { handle(type, data) }
             }
 
-            override fun onClosed(eventSource: EventSource) = retry()
+            override fun onClosed(eventSource: EventSource) = lost(current)
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                if (current != generation) return
                 if (response?.code == 401) {
-                    notices.tryEmit("This phone was removed from ${serverName.value}. Pair it again.")
-                    forgetPairing()
+                    if (current == generation) unpaired()
                 } else {
-                    retry()
-                }
-            }
-
-            private fun retry() {
-                if (current != generation) return
-                connected.value = false
-                scope.launch {
-                    delay(3000)
-                    if (current == generation) connect()
+                    lost(current)
                 }
             }
         })
     }
 
+    /** The stream ended. Tries again while there's a reason to, less and less often while the computer stays out of reach. */
+    @Synchronized
+    private fun lost(current: Int) {
+        if (current != generation) return
+        stream = null
+        connected.value = false
+        if (!foreground && working.value == 0) return
+        val pause = retryPause
+        retryPause = minOf(retryPause * 2, MAX_RETRY_MS)
+        scope.launch {
+            delay(pause)
+            retry(current)
+        }
+    }
+
+    @Synchronized
+    private fun retry(current: Int) {
+        if (current == generation && stream == null && (foreground || working.value > 0)) connect()
+    }
+
+    @Synchronized
+    private fun reached() {
+        retryPause = RETRY_MS
+    }
+
     private fun handle(type: String?, data: String) {
         when (type) {
             "ready" -> {
+                reached()
                 connected.value = true
                 scope.launch { sync() }
             }
             "transfer" -> upsert(parseTransfer(JSONObject(data)))
-            "transfer-removed" -> {
-                val id = JSONObject(data).getString("id")
-                cancelled.add(id)
-                transfers.update { list -> list.filter { it.id != id } }
-            }
+            "transfer-removed" -> removed(JSONObject(data).getString("id"))
             "transfer-progress" -> JSONObject(data).let { event -> uploaded.update { it + (event.getString("fileId") to event.getLong("received")) } }
             "transfer-delivery" -> JSONObject(data).let { event -> downloaded.update { it + (event.getString("fileId") to event.getLong("sent")) } }
             "devices" -> JSONArray(data).let { list -> devices.value = (0 until list.length()).map { parseDevice(list.getJSONObject(it)) } }
@@ -245,21 +354,75 @@ class Repo(private val app: Application) {
 
     private fun sync() {
         val client = api ?: return
+        val window = SyncWindow()
+        synchronized(listLock) { syncing = window }
         try {
             applySession(client.session())
             devices.value = client.devices()
-            val all = client.transfers()
-            transfers.value = all
+            val fetched = client.transfers()
+            val all = synchronized(listLock) {
+                // An event that arrived while this was fetching is newer than the list, and must not be undone by it.
+                val known = fetched.mapTo(HashSet()) { it.id }
+                val merged = window.changed.values.filter { it.id !in known } +
+                    fetched.filter { it.id !in window.removed }.map { window.changed[it.id] ?: it }
+                transfers.value = merged
+                merged
+            }
+            all.forEach(::settle)
             all.forEach(::fetchReady)
         } catch (error: ApiException) {
-            if (error.status == 401) forgetPairing()
+            // Out of reach again already: the stream notices too, and reconnecting syncs once more.
+            if (error.status == 401) unpaired()
+        } finally {
+            synchronized(listLock) { if (syncing === window) syncing = null }
         }
     }
 
     private fun upsert(transfer: Transfer) {
-        transfers.update { list -> if (list.any { it.id == transfer.id }) list.map { if (it.id == transfer.id) transfer else it } else listOf(transfer) + list }
+        synchronized(listLock) {
+            syncing?.let {
+                it.removed.remove(transfer.id)
+                it.changed[transfer.id] = transfer
+            }
+            transfers.update { list -> if (list.any { it.id == transfer.id }) list.map { if (it.id == transfer.id) transfer else it } else listOf(transfer) + list }
+        }
         if (!transfer.isOpen) cancelled.add(transfer.id)
+        settle(transfer)
         fetchReady(transfer)
+    }
+
+    private fun removed(id: String) {
+        cancelled.add(id)
+        val gone = synchronized(listLock) {
+            syncing?.let {
+                it.changed.remove(id)
+                it.removed.add(id)
+            }
+            val found = transfers.value.firstOrNull { it.id == id }
+            transfers.update { list -> list.filter { it.id != id } }
+            found
+        }
+        val ids = gone?.files?.map { it.id } ?: return
+        uploaded.update { it - ids }
+        downloaded.update { it - ids }
+    }
+
+    /** Forgets the progress of files that have stopped moving, so those maps only ever hold what's under way. */
+    private fun settle(transfer: Transfer) {
+        val ids = transfer.files.map { it.id }
+        if (transfer.files.none { it.state == "UPLOADING" } && ids.any { it in uploaded.value }) uploaded.update { it - ids }
+        if (transfer.files.none { it.state == "READY" } && ids.any { it in downloaded.value }) downloaded.update { it - ids }
+    }
+
+    /** Counts [block] as work under way: see [working]. */
+    private suspend fun <T> busy(block: suspend () -> T): T {
+        working.update { it + 1 }
+        try {
+            return block()
+        } finally {
+            working.update { it - 1 }
+            rest()
+        }
     }
 
     // ---------- Answering ----------
@@ -273,64 +436,38 @@ class Repo(private val app: Application) {
         act(transfer, "cancel")
     }
 
-    private fun act(transfer: Transfer, action: String) {
-        val client = api ?: return
-        scope.launch {
-            try {
-                upsert(client.act(transfer.id, action))
-            } catch (error: ApiException) {
-                notices.tryEmit(error.message.orEmpty())
-            }
-        }
-    }
+    private fun act(transfer: Transfer, action: String) = request { client -> upsert(client.act(transfer.id, action)) }
 
     fun remove(transfer: Transfer) {
-        val client = api ?: return
         cancelled.add(transfer.id)
-        scope.launch {
-            try {
-                client.remove(transfer.id)
-                transfers.update { list -> list.filter { it.id != transfer.id } }
-            } catch (error: ApiException) {
-                notices.tryEmit(error.message.orEmpty())
-            }
+        request { client ->
+            client.remove(transfer.id)
+            removed(transfer.id)
         }
     }
 
     // ---------- Sending ----------
 
-    fun sendText(recipientId: String, text: String) {
-        val client = api ?: return
-        scope.launch {
-            try {
-                upsert(client.sendText(recipientId, text))
-            } catch (error: ApiException) {
-                notices.tryEmit(error.message.orEmpty())
-            }
-        }
-    }
+    fun sendText(recipientId: String, text: String) = request { client -> upsert(client.sendText(recipientId, text)) }
 
-    fun sendFiles(recipientId: String, uris: List<Uri>) {
-        val client = api ?: return
-        scope.launch {
+    fun sendFiles(recipientId: String, uris: List<Uri>) = request { client ->
+        busy {
+            val files = uris.mapNotNull(::describe)
             try {
-                val files = uris.mapNotNull(::describe)
                 if (files.isEmpty()) {
                     notices.tryEmit("Those files couldn't be read.")
-                    return@launch
-                }
-                val transfer = client.announce(recipientId, files)
-                upsert(transfer)
-                // One upload at a time, in the order they were picked.
-                uploads.withLock {
-                    transfer.files.zip(files).forEach { (announced, file) ->
-                        if (announced.state == "UPLOADING") upload(client, transfer.id, announced.id, file)
+                } else {
+                    val transfer = client.announce(recipientId, files)
+                    upsert(transfer)
+                    // One upload at a time, in the order they were picked.
+                    uploads.withLock {
+                        transfer.files.zip(files).forEach { (announced, file) ->
+                            if (announced.state == "UPLOADING") upload(client, transfer.id, announced.id, file)
+                        }
                     }
                 }
-            } catch (error: ApiException) {
-                notices.tryEmit(error.message.orEmpty())
-            } catch (error: IOException) {
-                notices.tryEmit("Those files couldn't be read.")
+            } finally {
+                files.forEach { it.temporary?.delete() }
             }
         }
     }
@@ -352,6 +489,10 @@ class Repo(private val app: Application) {
                     if (error.status != 409 && error.status != 404) notices.tryEmit("${file.name}: ${error.message}")
                     return
                 }
+            } catch (error: RuntimeException) {
+                // The app that shared the file has taken back the permission to read it.
+                notices.tryEmit("${file.name} can't be read any more. Share it again.")
+                return
             }
             delay(pause)
             val received = runCatching { client.received(transferId, fileId) }.getOrDefault(offset)
@@ -378,21 +519,26 @@ class Repo(private val app: Application) {
                 }
             }
         }
-        val type = resolver.getType(uri) ?: "application/octet-stream"
+        val type = runCatching { resolver.getType(uri) }.getOrNull() ?: "application/octet-stream"
         if (size >= 0) {
             return OutgoingFile(name, size, type) { resolver.openInputStream(uri) ?: throw IOException("Can't open $name") }
         }
-        // No size on offer (some apps stream what they share): copy it out once to learn it.
-        val copy = File.createTempFile("share", null, app.cacheDir)
-        val input = runCatching { resolver.openInputStream(uri) }.getOrNull() ?: return null
-        input.use { source -> copy.outputStream().use { source.copyTo(it) } }
-        copy.deleteOnExit()
-        return OutgoingFile(name, copy.length(), type) { copy.inputStream() }
+        // No size on offer (some apps stream what they share): copy it out once to learn it. Deleted once it's sent.
+        val copy = runCatching { File.createTempFile(SHARE_PREFIX, null, app.cacheDir) }.getOrNull() ?: return null
+        val copied = runCatching {
+            val input = resolver.openInputStream(uri) ?: throw IOException("Can't open $name")
+            input.use { source -> copy.outputStream().use { source.copyTo(it) } }
+        }
+        if (copied.isFailure) {
+            copy.delete()
+            return null
+        }
+        return OutgoingFile(name, copy.length(), type, copy) { copy.inputStream() }
     }
 
     // ---------- Receiving ----------
 
-    /** Saves the files of a transfer this phone accepted into Downloads, as soon as they are ready on the computer. */
+    /** Saves the files of a transfer this phone accepted, as soon as they are ready on the computer. */
     private fun fetchReady(transfer: Transfer) {
         val self = me.value ?: return
         if (transfer.recipientId != self.id || transfer.status != "ACCEPTED") return
@@ -403,12 +549,13 @@ class Repo(private val app: Application) {
         synchronized(tally) { tally[0] += ready.size }
         ready.forEach { file ->
             scope.launch {
-                val saved = downloads.withLock { save(transfer, file) }
+                val saved = busy { downloads.withLock { save(transfer, file) } }
                 val finished = synchronized(tally) {
                     tally[0]--
                     if (saved) tally[1]++
                     if (tally[0] == 0) tally[1].also { tally[1] = 0 } else -1
                 }
+                if (finished >= 0) unsaved.remove(transfer.id, tally)
                 if (finished > 0) {
                     val what = if (finished == 1) file.name else "$finished files"
                     notices.tryEmit("Saved $what to ${folderName(saveFolder.value)}")
@@ -439,22 +586,43 @@ class Repo(private val app: Application) {
 
     private fun isDownloadsEntry(target: Uri) = target.authority == MediaStore.AUTHORITY
 
-    /** Downloads one file to where received files go. True once it's fully saved. */
+    /** Saves one file to where received files go. True once it's fully there. */
     private suspend fun save(transfer: Transfer, file: TransferFile): Boolean {
-        val client = api ?: return false
+        val client = api
         val resolver = app.contentResolver
-        val target = createTarget(file)
-        if (target == null) {
-            notices.tryEmit("Couldn't save ${file.name}.")
+        val target = if (client == null) null else runCatching { createTarget(file) }.getOrNull()
+        if (client == null || target == null) {
+            if (client != null) notices.tryEmit("Couldn't save ${file.name}.")
             fetching.remove(file.id)
             return false
         }
+        val done = try {
+            download(client, transfer, file, target)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // The folder was taken away mid-file, or the phone is out of space.
+            false
+        }
+        if (done) {
+            runCatching { if (isDownloadsEntry(target)) resolver.update(target, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null) }
+            savedFiles.update { it + (file.id to target) }
+        } else {
+            runCatching { if (isDownloadsEntry(target)) resolver.delete(target, null, null) else DocumentsContract.deleteDocument(resolver, target) }
+            fetching.remove(file.id)
+            if (transfer.id !in cancelled) notices.tryEmit("Couldn't save ${file.name}. It'll try again when you reopen AndroidDrop.")
+        }
+        return done
+    }
+
+    /** Downloads [file] into [target], carrying on from what's written whenever the connection drops. True once it's all there. */
+    private suspend fun download(client: ApiClient, transfer: Transfer, file: TransferFile, target: Uri): Boolean {
+        val resolver = app.contentResolver
         var written = 0L
         var lastProgress = System.currentTimeMillis()
         var pause = 1000L
-        var done = false
-        while (!done) {
-            if (transfer.id in cancelled) break
+        while (true) {
+            if (transfer.id in cancelled) return false
             val before = written
             try {
                 client.download(transfer.id, file.id, written).use { response ->
@@ -472,33 +640,23 @@ class Repo(private val app: Application) {
                         }
                     }
                 }
-                done = written >= file.size
+                if (written >= file.size) return true
             } catch (error: ApiException) {
                 // Gone on the computer, or no longer ours to fetch.
-                if (error.status != 0) break
+                if (error.status != 0) return false
             } catch (error: IOException) {
                 // Wi-Fi dropped mid-file: carry on from what's written.
             }
-            if (done) break
             if (written > before) {
                 lastProgress = System.currentTimeMillis()
                 pause = 1000
             } else if (System.currentTimeMillis() - lastProgress > RECONNECT_FOR_MS) {
-                break
+                return false
             } else {
                 pause = minOf(pause * 2, 10_000)
             }
             delay(pause)
         }
-        if (done) {
-            if (isDownloadsEntry(target)) resolver.update(target, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
-            savedFiles.update { it + (file.id to target) }
-        } else {
-            runCatching { if (isDownloadsEntry(target)) resolver.delete(target, null, null) else DocumentsContract.deleteDocument(resolver, target) }
-            fetching.remove(file.id)
-            if (transfer.id !in cancelled) notices.tryEmit("Couldn't save ${file.name}. It'll try again when you reopen AndroidDrop.")
-        }
-        return done
     }
 
     companion object {
@@ -507,8 +665,14 @@ class Repo(private val app: Application) {
         private const val KEY_SERVER = "serverName"
         private const val KEY_FOLDER = "saveFolder"
         private const val KEY_THEME = "theme"
+        private const val SHARE_PREFIX = "androiddrop-share"
         /** How long to keep reconnecting without getting any further before giving up on a file. */
         private const val RECONNECT_FOR_MS = 3 * 60_000L
+        /** The pause before reconnecting to the computer: this at first, doubling up to the longest. */
+        private const val RETRY_MS = 3_000L
+        private const val MAX_RETRY_MS = 30_000L
+        /** How long the connection is kept after the app leaves the screen with nothing moving. */
+        private const val LINGER_MS = 60_000L
         /** Worth trying again: the connection dropped, or the computer hasn't noticed the old one did. */
         private val TRANSIENT = setOf(0, 408, 416, 423, 502, 503, 504)
 

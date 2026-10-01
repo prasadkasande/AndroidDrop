@@ -71,7 +71,9 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.geometry.Offset
@@ -350,8 +352,10 @@ private fun Home(repo: Repo, snackbar: SnackbarHostState) {
     val transfers by repo.transfers.collectAsStateWithLifecycle()
     val connected by repo.connected.collectAsStateWithLifecycle()
     val serverName by repo.serverName.collectAsStateWithLifecycle()
-    val uploaded by repo.uploaded.collectAsStateWithLifecycle()
-    val downloaded by repo.downloaded.collectAsStateWithLifecycle()
+    // Held as states, not values: only the rows that show progress read them, so only those redraw as bytes move.
+    val uploaded = repo.uploaded.collectAsStateWithLifecycle()
+    val downloaded = repo.downloaded.collectAsStateWithLifecycle()
+    val working by repo.working.collectAsStateWithLifecycle()
     val saved by repo.savedFiles.collectAsStateWithLifecycle()
     val share by repo.pendingShare.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf(0) }
@@ -362,12 +366,20 @@ private fun Home(repo: Repo, snackbar: SnackbarHostState) {
     val dark = LocalDark.current
 
     val meId = me?.id
-    val peers = devices.filter { it.id != meId }
-    val received = transfers.filter { it.recipientId == meId && it.isOpen }
-    val sent = transfers.filter { it.senderId == meId }
-    val waiting = received.filter { it.status == "PENDING" }
+    val peers = remember(devices, meId) { devices.filter { it.id != meId } }
+    val received = remember(transfers, meId) { transfers.filter { it.recipientId == meId && it.isOpen } }
+    val sent = remember(transfers, meId) { transfers.filter { it.senderId == meId } }
+    val waiting = remember(received) { received.filter { it.status == "PENDING" } }
     val request = waiting.lastOrNull { it.id !in later }
-    val card = TransferContext(repo, meId, devices, uploaded, downloaded, saved, dark)
+    val card = remember(repo, meId, devices, saved, dark) { TransferContext(repo, meId, devices, uploaded, downloaded, saved, dark) }
+
+    // A big transfer takes a while: the screen stays on meanwhile, so the phone doesn't lock and put the app to sleep.
+    val view = LocalView.current
+    val moving = working > 0
+    DisposableEffect(view, moving) {
+        view.keepScreenOn = moving
+        onDispose { view.keepScreenOn = false }
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val to = target
@@ -451,7 +463,8 @@ private fun Home(repo: Repo, snackbar: SnackbarHostState) {
             // A fixed screen: the devices and the messages share the height left under the button, and scroll inside.
             // While typing, the keyboard takes most of it, so only the messages stay.
             val typing = WindowInsets.isImeVisible
-            val live = transfers.filter { it.isOpen && it.text == null && phaseOf(it).let { phase -> phase == "transferring" || phase == "saving" } }
+            val live = remember(transfers) { transfers.filter { it.isOpen && it.text == null && phaseOf(it).let { phase -> phase == "transferring" || phase == "saving" } } }
+            val notes = remember(transfers) { transfers.filter { it.text != null && it.status != "CANCELLED" && it.status != "EXPIRED" }.sortedBy { it.createdAt } }
             Column(modifier = body.padding(start = 16.dp, end = 16.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 if (!typing) {
                     PageTitle(repo, tab, connected, serverName)
@@ -464,7 +477,7 @@ private fun Home(repo: Repo, snackbar: SnackbarHostState) {
                     Stage(peers, dark, Modifier.weight(1f)) { deliver(it.id, Outgoing.PickFiles) }
                 }
                 Messages(
-                    transfers.filter { it.text != null && it.status != "CANCELLED" && it.status != "EXPIRED" }.sortedBy { it.createdAt },
+                    notes,
                     card,
                     peers.isNotEmpty(),
                     Modifier.weight(1f),
@@ -532,8 +545,8 @@ private class TransferContext(
     val repo: Repo,
     val meId: String?,
     val devices: List<Device>,
-    val uploaded: Map<String, Long>,
-    val downloaded: Map<String, Long>,
+    val uploaded: State<Map<String, Long>>,
+    val downloaded: State<Map<String, Long>>,
     val saved: Map<String, Uri>,
     val dark: Boolean,
 )
@@ -585,15 +598,18 @@ private fun Panel(title: String, modifier: Modifier = Modifier, content: @Compos
     }
 }
 
-/** How far along a transfer is, 0 to 1: the upload to the computer, or (while "saving") the download from it. */
+/**
+ * How far along a transfer is, 0 to 1: the upload to the computer, or (while "saving") the download from it. Live
+ * progress is only looked up for files that are moving, so a row with none isn't redrawn when another's bytes arrive.
+ */
 private fun progressOf(transfer: Transfer, phase: String, context: TransferContext): Float {
     val done = transfer.files.sumOf { file ->
         if (phase == "saving") when (file.state) {
             "DELIVERED" -> file.size
-            "READY" -> minOf(file.size, context.downloaded[file.id] ?: 0L)
+            "READY" -> minOf(file.size, context.downloaded.value[file.id] ?: 0L)
             else -> 0L
         } else when (file.state) {
-            "UPLOADING" -> minOf(file.size, context.uploaded[file.id] ?: 0L)
+            "UPLOADING" -> minOf(file.size, context.uploaded.value[file.id] ?: 0L)
             "FAILED", "REMOVED" -> 0L
             else -> file.size
         }
@@ -681,7 +697,10 @@ private fun Stage(peers: List<Device>, dark: Boolean, modifier: Modifier = Modif
                             horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier.width(120.dp).clip(RoundedCornerShape(18.dp)).clickable { onPick(device) }.padding(8.dp),
                         ) {
-                            Box(modifier = Modifier.onGloballyPositioned { spots[device.id] = Rect(it.positionInRoot(), it.size.toSize()) }) {
+                            Box(modifier = Modifier.onGloballyPositioned {
+                                val spot = Rect(it.positionInRoot(), it.size.toSize())
+                                if (spots[device.id] != spot) spots[device.id] = spot
+                            }) {
                                 Avatar(device.id, device.host, device.platform, 76.dp, dark, device.online)
                             }
                             Spacer(Modifier.height(10.dp))
@@ -967,8 +986,9 @@ private fun fileState(file: TransferFile, incoming: Boolean, saved: Boolean): St
 /** A photo's small preview from the computer. */
 @Composable
 private fun Preview(repo: Repo, transferId: String, fileId: String, modifier: Modifier) {
-    val image by produceState<ImageBitmap?>(initialValue = null, fileId) {
-        value = withContext(Dispatchers.IO) { runCatching { repo.preview(transferId, fileId) }.getOrNull() }
+    // One seen before is drawn at once; a new one is fetched in the background.
+    val image by produceState(initialValue = repo.cachedPreview(fileId), fileId) {
+        if (value == null) value = withContext(Dispatchers.IO) { runCatching { repo.preview(transferId, fileId) }.getOrNull() }
     }
     Box(modifier = modifier.background(MaterialTheme.colorScheme.surfaceVariant)) {
         image?.let { Image(bitmap = it, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
