@@ -13,7 +13,14 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -303,6 +310,7 @@ private sealed class Outgoing {
     class Shared(val share: Repo.Share) : Outgoing()
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun Home(repo: Repo, snackbar: SnackbarHostState) {
     val me by repo.me.collectAsStateWithLifecycle()
@@ -406,50 +414,39 @@ private fun Home(repo: Repo, snackbar: SnackbarHostState) {
             }
         },
     ) { padding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(padding).imePadding(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            item {
-                Column(modifier = Modifier.padding(top = 4.dp)) {
-                    Text(SECTIONS[tab].label, fontSize = 30.sp, lineHeight = 36.sp, fontWeight = FontWeight.Bold)
-                    Text(
-                        when {
-                            !connected -> "Reconnecting to $serverName…"
-                            tab == 1 -> "Accepted files are saved to ${repo.folderName(repo.saveFolder.collectAsStateWithLifecycle().value)}."
-                            else -> SECTIONS[tab].hint
-                        },
-                        fontSize = 15.sp,
-                        color = if (connected) MaterialTheme.colorScheme.onSurfaceVariant else Warning,
-                    )
+        val body = Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()
+        if (tab == 0) {
+            // A fixed screen: the devices and the messages share the height left under the button, and scroll inside.
+            // While typing, the keyboard takes most of it, so only the messages stay.
+            val typing = WindowInsets.isImeVisible
+            val live = transfers.filter { it.isOpen && it.text == null && phaseOf(it).let { phase -> phase == "transferring" || phase == "saving" } }
+            Column(modifier = body.padding(start = 16.dp, end = 16.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (!typing) {
+                    PageTitle(repo, tab, connected, serverName)
+                    Button(onClick = { sendTo(Outgoing.PickFiles) }, enabled = peers.isNotEmpty(), modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                        Icon(ClipIcon, contentDescription = null, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Choose files", fontSize = 16.sp)
+                    }
+                    live.firstOrNull()?.let { transfer -> InProgress(transfer, live.size - 1, card) { tab = if (transfer.recipientId == meId) 1 else 2 } }
+                    Stage(peers, dark, Modifier.weight(1f)) { deliver(it.id, Outgoing.PickFiles) }
                 }
+                Messages(
+                    transfers.filter { it.text != null && it.status != "CANCELLED" && it.status != "EXPIRED" }.sortedBy { it.createdAt },
+                    card,
+                    peers.isNotEmpty(),
+                    Modifier.weight(1f),
+                ) { sendTo(Outgoing.Note(it)) }
             }
-            when (tab) {
-                0 -> {
-                    item {
-                        Button(onClick = { sendTo(Outgoing.PickFiles) }, enabled = peers.isNotEmpty(), modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                            Icon(ClipIcon, contentDescription = null, modifier = Modifier.size(20.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text("Choose files", fontSize = 16.sp)
-                        }
-                    }
-                    item { Stage(peers, dark) { deliver(it.id, Outgoing.PickFiles) } }
-                    val live = transfers.filter { it.isOpen && it.text == null && phaseOf(it) != "done" }
-                    if (live.isNotEmpty()) {
-                        item {
-                            Panel("In progress") {
-                                live.forEachIndexed { index, transfer ->
-                                    if (index > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                                    TransferRow(transfer, card)
-                                }
-                            }
-                        }
-                    }
-                    item { Messages(transfers.filter { it.text != null && it.status != "CANCELLED" && it.status != "EXPIRED" }, card, peers.isNotEmpty()) { sendTo(Outgoing.Note(it)) } }
-                }
-                1 -> transferList(received, card, "Nothing received yet", "When a device shares something with you, you'll be asked to accept it.")
-                else -> transferList(sent, card, "Nothing sent yet", "Pick a device on Nearby, or share to AndroidDrop from another app.")
+        } else {
+            LazyColumn(
+                modifier = body,
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                item { PageTitle(repo, tab, connected, serverName) }
+                if (tab == 1) transferList(received, card, "Nothing received yet", "When a device shares something with you, you'll be asked to accept it.")
+                else transferList(sent, card, "Nothing sent yet", "Pick a device on Nearby, or share to AndroidDrop from another app.")
             }
         }
     }
@@ -527,14 +524,71 @@ private fun androidx.compose.foundation.lazy.LazyListScope.transferList(list: Li
     }
 }
 
+@Composable
+private fun PageTitle(repo: Repo, tab: Int, connected: Boolean, serverName: String) {
+    val folder by repo.saveFolder.collectAsStateWithLifecycle()
+    Column(modifier = Modifier.padding(top = 4.dp)) {
+        Text(SECTIONS[tab].label, fontSize = 30.sp, lineHeight = 36.sp, fontWeight = FontWeight.Bold)
+        Text(
+            when {
+                !connected -> "Reconnecting to $serverName…"
+                tab == 1 -> "Accepted files are saved to ${repo.folderName(folder)}."
+                else -> SECTIONS[tab].hint
+            },
+            fontSize = 15.sp,
+            color = if (connected) MaterialTheme.colorScheme.onSurfaceVariant else Warning,
+        )
+    }
+}
+
 /** A card with its title inside, like the panels on the computer. */
 @Composable
-private fun Panel(title: String, content: @Composable () -> Unit) {
-    Surface(shape = CARD, color = MaterialTheme.colorScheme.surface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), modifier = Modifier.fillMaxWidth()) {
+private fun Panel(title: String, modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Surface(shape = CARD, color = MaterialTheme.colorScheme.surface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), modifier = modifier.fillMaxWidth()) {
         Column {
-            Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 12.dp))
+            Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 10.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             content()
+        }
+    }
+}
+
+/** How far along a transfer is, 0 to 1: the upload to the computer, or (while "saving") the download from it. */
+private fun progressOf(transfer: Transfer, phase: String, context: TransferContext): Float {
+    val done = transfer.files.sumOf { file ->
+        if (phase == "saving") when (file.state) {
+            "DELIVERED" -> file.size
+            "READY" -> minOf(file.size, context.downloaded[file.id] ?: 0L)
+            else -> 0L
+        } else when (file.state) {
+            "UPLOADING" -> minOf(file.size, context.uploaded[file.id] ?: 0L)
+            "FAILED", "REMOVED" -> 0L
+            else -> file.size
+        }
+    }
+    return (done.toFloat() / transfer.totalSize.coerceAtLeast(1)).coerceIn(0f, 1f)
+}
+
+/** One slim line on Nearby for the transfer under way. Tap it for the full list. */
+@Composable
+private fun InProgress(transfer: Transfer, others: Int, context: TransferContext, onOpen: () -> Unit) {
+    val incoming = transfer.recipientId == context.meId
+    val fraction = progressOf(transfer, phaseOf(transfer), context)
+    Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).clickable(onClick = onOpen)) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "${if (incoming) "Receiving" else "Sending"} ${summarize(transfer)}${if (others > 0) " and $others more" else ""}",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(10.dp))
+                Text("${(fraction * 100).toInt()}%", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape))
         }
     }
 }
@@ -559,9 +613,22 @@ private fun Avatar(id: String, host: Boolean, platform: String, size: Dp, dark: 
 /** The devices in range as large round avatars, like AirDrop. Tap one to send it files. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun Stage(peers: List<Device>, dark: Boolean, onPick: (Device) -> Unit) {
-    Surface(shape = CARD, color = MaterialTheme.colorScheme.surface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), modifier = Modifier.fillMaxWidth()) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(vertical = 28.dp, horizontal = 12.dp)) {
+private fun Stage(peers: List<Device>, dark: Boolean, modifier: Modifier = Modifier, onPick: (Device) -> Unit) {
+    val ring = MaterialTheme.colorScheme.onSurface.copy(alpha = if (dark) 0.10f else 0.08f)
+    Surface(shape = CARD, color = MaterialTheme.colorScheme.surface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), modifier = modifier.fillMaxWidth()) {
+        // Faint rings spreading from the middle, as on the computer.
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.fillMaxSize().drawBehind {
+                val reach = maxOf(size.width, size.height) * 0.75f
+                var radius = 64.dp.toPx()
+                while (radius < reach) {
+                    drawCircle(color = ring, radius = radius, style = Stroke(width = 1.dp.toPx()))
+                    radius += 52.dp.toPx()
+                }
+            },
+        ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.verticalScroll(rememberScrollState()).padding(vertical = 16.dp, horizontal = 12.dp)) {
             if (peers.isEmpty()) {
                 Text("No other devices yet", fontSize = 17.sp, fontWeight = FontWeight.Medium)
                 Spacer(Modifier.height(6.dp))
@@ -590,21 +657,26 @@ private fun Stage(peers: List<Device>, dark: Boolean, onPick: (Device) -> Unit) 
                 )
             }
         }
+        }
     }
 }
 
-/** Notes and links in both directions, oldest first like a chat, with a box to write one. */
+/** Notes and links in both directions, oldest first like a chat, with a box to write one. The box keeps its size; the chat scrolls inside. */
 @Composable
-private fun Messages(notes: List<Transfer>, context: TransferContext, canSend: Boolean, onSend: (String) -> Unit) {
+private fun Messages(notes: List<Transfer>, context: TransferContext, canSend: Boolean, modifier: Modifier, onSend: (String) -> Unit) {
     var draft by rememberSaveable { mutableStateOf("") }
     val clipboard = LocalClipboardManager.current
     val links = LocalUriHandler.current
-    Panel("Messages") {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (notes.isEmpty()) {
-                Text("No messages yet", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.fillMaxWidth().padding(vertical = 20.dp), textAlign = TextAlign.Center)
+    val list = rememberLazyListState()
+    // Keep the newest message in view.
+    LaunchedEffect(notes.size) { if (notes.isNotEmpty()) list.scrollToItem(notes.size - 1) }
+    Panel("Messages", modifier) {
+        if (notes.isEmpty()) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("No messages yet", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            notes.sortedBy { it.createdAt }.forEach { note ->
+        } else LazyColumn(state = list, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(notes, key = { it.id }) { note ->
                 val mine = note.senderId == context.meId
                 val text = note.text.orEmpty()
                 val pending = note.status == "PENDING"
@@ -631,13 +703,13 @@ private fun Messages(notes: List<Transfer>, context: TransferContext, canSend: B
             }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.Bottom) {
+        Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.Bottom) {
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it },
                 placeholder = { Text("Write a note or paste a link") },
                 shape = RoundedCornerShape(22.dp),
-                maxLines = 5,
+                maxLines = 3,
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(8.dp))
@@ -730,22 +802,7 @@ private fun TransferRow(transfer: Transfer, context: TransferContext) {
     val peer = context.devices.firstOrNull { it.id == peerId }
     val peerName = peer?.name ?: if (incoming) transfer.senderName else transfer.recipientName
     val phase = phaseOf(transfer)
-    val total = transfer.totalSize.coerceAtLeast(1)
-    val sentBytes = transfer.files.sumOf { file ->
-        when (file.state) {
-            "UPLOADING" -> minOf(file.size, context.uploaded[file.id] ?: 0L)
-            "FAILED", "REMOVED" -> 0L
-            else -> file.size
-        }
-    }
-    val savedBytes = transfer.files.sumOf { file ->
-        when (file.state) {
-            "DELIVERED" -> file.size
-            "READY" -> minOf(file.size, context.downloaded[file.id] ?: 0L)
-            else -> 0L
-        }
-    }
-    val fraction = (if (phase == "saving") savedBytes else sentBytes).toFloat() / total
+    val fraction = progressOf(transfer, phase, context)
     val percent = (fraction * 100).toInt()
     val accent = MaterialTheme.colorScheme.primary
     val (status, dot) = when (phase) {
